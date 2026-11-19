@@ -1,0 +1,22 @@
+name: im-dev
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${IM_MYSQL_ROOT_PASSWORD:?Set IM_MYSQL_ROOT_PASSWORD in docker/.env}
+      MYSQL_DATABASE: ${IM_MYSQL_DATABASE:-im}
+      MYSQL_USER: ${IM_MYSQL_USER:-im_dev}
+      MYSQL_PASSWORD: ${IM_MYSQL_PASSWORD:?Set IM_MYSQL_PASSWORD in docker/.env}
+    ports:
+      - "127.0.0.1:${IM_MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+
+  redis:
+    image: redis:7.4-alpine
+    ports:
+      - "127.0.0.1:${IM_REDIS_PORT:-6379}:6379"
+
+volumes:
+  mysql-data:

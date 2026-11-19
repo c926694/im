@@ -1,0 +1,23 @@
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Go build and local workspace artifacts
+/backend/bin/
+*.test
+coverage.out
+go.work
+go.work.sum
+
+# Frontend dependencies and generated output
+/frontend/node_modules/
+/frontend/dist/
+/frontend/coverage/
+
+# Local tooling
+.DS_Store
+.idea/
+.vscode/
+*.log
