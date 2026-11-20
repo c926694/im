@@ -15,6 +15,7 @@ go.work.sum
 /frontend/node_modules/
 /frontend/dist/
 /frontend/coverage/
+/.local/
 
 # Local tooling
 .DS_Store

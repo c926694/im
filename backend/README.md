@@ -17,7 +17,33 @@ backend/
 └── migrations/                # 按版本管理的数据库迁移 SQL
 ```
 
-Go 模块位于 `backend/`。当前已实现单聊数据层，尚未接入 Gin 或 WebSocket。
+Go 模块位于 `backend/`。Gin 在同一个端口提供单聊 HTTP API 和 WebSocket 握手路由。容器启动方式见 [Docker Compose 说明](../docker/README.md)。
+
+## 启动服务
+
+先按[本地数据库说明](../docker/README.md#初始化数据库和运行集成测试)启动 MySQL、应用迁移。然后在 `backend/` 下运行：
+
+```sh
+export IM_MYSQL_DSN='im_dev:im-local-app-example@tcp(127.0.0.1:3306)/im'
+export IM_JWT_SECRET="$(openssl rand -hex 32)"
+go run ./cmd/im
+```
+
+示例 DSN 仅用于本地开发。默认监听 `127.0.0.1:8080`，可通过 `IM_HTTP_ADDR` 修改。签名密钥至少 32 字节；更换密钥会使之前签发的 token 失效。非本地环境使用 HTTPS/WSS，反向代理日志也不要记录 `/ws` 的查询参数或 `Authorization` 请求头。
+
+## 单聊 HTTP API
+
+| 方法和路径 | 请求和结果 |
+| --- | --- |
+| `POST /api/v1/auth/register` | JSON：`username`、`password`、`nickname`。返回 `201` 和 `user_id`。 |
+| `POST /api/v1/auth/login` | JSON：`username`、`password`。返回 `user_id`、`access_token`、`expires_in`（秒，有效期 1 小时）。 |
+| `POST /api/v1/ws/tickets` | 返回 `ticket` 和 `expires_at`。用新票据连接 `GET /ws?ticket=...`。 |
+| `POST /api/v1/conversations/direct` | JSON：`{"peer_username":"xiaoli"}`。按完整用户名查找，忽略大小写，返回新建或已有会话的 `id`。 |
+| `GET /api/v1/conversations` | 返回会话摘要数组，包括对方 ID、昵称 `peer_nickname`、最新序号、已读游标和未读数。 |
+| `POST /api/v1/conversations/:id/messages` | JSON：`client_msg_id`（UUID）、`content`。返回已保存的消息；重试复用同一个 UUID。 |
+| `GET /api/v1/conversations/:id/messages` | 返回消息数组。默认倒序查历史；`before_seq` 查询更早消息；`after_seq` 正序补拉，`0` 表示从第一条开始。两个游标不能同时传。`limit` 默认 50、最多 100。 |
+
+除注册和登录外，HTTP API 带 `Authorization: Bearer <access_token>`。WebSocket 握手只使用票据。账号使用 1–32 位 ASCII 字母、数字或下划线（转小写）；昵称 1–64 个字符。注册和登录均需提供 `password` 字符串，允许空字符串，不限制密码的长度或字符组合，保留首尾空格。新账号使用 Argon2id 保存密码哈希，已有 bcrypt 账号可以继续登录。JSON 里的用户、会话和消息 ID 以及消息序号均为十进制字符串，HTTP API 错误返回 `{"error":"错误码"}`。
 
 ## 单聊数据层
 
@@ -28,13 +54,22 @@ Go 模块位于 `backend/`。当前已实现单聊数据层，尚未接入 Gin �
 | `conversation_members` | 一个用户在某个会话中的成员关系和个人已读游标。 |
 | `messages` | 一条已保存的文本消息，按会话序号分页，按客户端 UUID 对同一发送人的重试去重。 |
 
-表间只使用逻辑外键：会话的两个用户 ID 指向 `users.id`，成员的用户和会话 ID 分别指向 `users.id`、`conversations.id`，消息的会话和发送者对应一条成员记录。数据库不创建物理外键，应用负责校验用户存在和成员权限。Go 数据访问使用 `sqlx`；会话列表先查成员记录取得会话 ID，再批量查会话和未读数，在 Go 中按 ID 合并，不连表。
+各表的业务字段说明见 [初始化 SQL](migrations/000001_direct_chat.up.sql) 和 [MySQL 字段备注迁移](migrations/000002_direct_chat_comments.up.sql)。
+
+表间只使用逻辑外键：会话的两个用户 ID 指向 `users.id`，成员的用户和会话 ID 分别指向 `users.id`、`conversations.id`，消息的会话和发送者对应一条成员记录。数据库不创建物理外键，应用负责校验用户存在和成员权限。Go 数据访问使用 `sqlx`；会话列表先查成员记录取得会话 ID，再批量查会话、未读数和对方昵称，在 Go 中按 ID 合并，不连表。
 
 新会话的 `last_seq` 和成员的 `last_read_seq` 默认都是 `0`，分别表示没有消息和未读到任何消息。消息表的 `seq` 没有默认值，第一条消息写入 `1`。
 
-`internal/chat` 提供建聊、发消息、会话列表、历史分页、增量补拉和标记已读。接 HTTP 时，在入口用 `NewMessageDraft` 校验消息，并把登录用户 ID 传给数据层，不从消息请求体取发送人。`History` 的 `beforeSeq=0` 表示从最新消息开始；`Sync` 使用设备自己的同步游标，不使用账号的已读游标。两者页大小为 `0` 时使用默认 50 条，最多 100 条。
+`internal/chat` 提供建聊、发消息、会话列表、历史分页、增量补拉和标记已读。Gin 入口用 `NewMessageDraft` 校验消息，并把登录用户的 ID 传给数据层，不从消息请求体取发送人。本阶段不开放已读接口。
 
 [数据库迁移及测试方法](../docker/README.md#初始化数据库和运行集成测试)
+
+## WebSocket 连接层
+
+- Gin 消耗一次性票据后，调用 `hub.Serve(w, r, userID)`。票据最多有效 30 秒，且不超过 Bearer 凭证的剩余有效期；握手失败或重连均需重新领票。连接保持默认同源校验。
+- `chat.SendMessage` 首次提交成功后，Gin 调用 `hub.Push(recipientID, event)`，向接收者的所有在线连接入队 `{"type":"message.created","data":{...}}`。`data` 与 HTTP 发消息的响应使用同一消息结构。推送不算送达或已读；客户端重连后用设备的同步游标补拉，按消息 ID 去重，只推进到已连续处理的最大 `seq`，不能用账号的 `last_read_seq` 代替。
+- 服务端每 30 秒发 Ping，收到 Pong 后将读期限延后 60 秒，单次写超时为 5 秒。连接队列最多 64 条，积压时只断开该连接。应用退出时显式调用 `hub.Close()`，关闭已升级的连接。
+- 在 `backend/` 下用 `go test -race ./internal/realtime` 运行真实 WebSocket 连接测试，不需要 MySQL。
 
 ## 依赖和事务边界
 
@@ -52,4 +87,4 @@ Go 模块位于 `backend/`。当前已实现单聊数据层，尚未接入 Gin �
 | 群聊 | 继续放在 `internal/chat` | 复用会话和消息模型，新增群角色及成员权限，不复制一套收发链路。 |
 | 虚拟积分红包 | `internal/redpacket` | 独立管理扣款、领取、流水和退款事务；提交后通过事件发聊天通知，不在事务中直接调用 MQ。 |
 
-下一步：接入 Gin 服务和注册登录，再把单聊数据层接到 HTTP 与 WebSocket。
+下一步：接入浏览器演示客户端，完成自动重连和增量补拉。

@@ -47,21 +47,36 @@ type Message struct {
 
 const selectMessage = `SELECT id, conversation_id, sender_id, client_msg_id, seq, content, created_at FROM messages`
 
-func (s *Store) SendMessage(ctx context.Context, userID, conversationID int64, draft MessageDraft) (Message, error) {
-	// 成员关系决定发送权限，知道会话 ID 并不代表可以发消息。
+type SendResult struct {
+	Message     Message
+	RecipientID int64
+	Created     bool
+}
+
+func (s *Store) SendMessage(ctx context.Context, userID, conversationID int64, draft MessageDraft) (SendResult, error) {
+	// 先确认当前用户是会话成员，防止非成员向别人的会话发消息。
 	if err := s.requireMember(ctx, userID, conversationID); err != nil {
-		return Message{}, err
+		return SendResult{}, err
 	}
 	tx, err := s.db.BeginTxx(ctx, nil)
 	if err != nil {
-		return Message{}, err
+		return SendResult{}, err
 	}
 	defer tx.Rollback()
 
 	// 锁住会话行，让同一会话的并发发送依次分配序号。
-	var lastSeq int64
-	if err := tx.GetContext(ctx, &lastSeq, `SELECT last_seq FROM conversations WHERE id = ? FOR UPDATE`, conversationID); err != nil {
-		return Message{}, err
+	var conversation struct {
+		LastSeq int64 `db:"last_seq"`
+		LowID   int64 `db:"direct_user_low_id"`
+		HighID  int64 `db:"direct_user_high_id"`
+	}
+	if err := tx.GetContext(ctx, &conversation, `
+		SELECT last_seq, direct_user_low_id, direct_user_high_id FROM conversations WHERE id = ? FOR UPDATE`, conversationID); err != nil {
+		return SendResult{}, err
+	}
+	recipientID := conversation.LowID
+	if userID == conversation.LowID {
+		recipientID = conversation.HighID
 	}
 
 	// 分配序号前先查重，重试返回原消息，不占用新的序号。
@@ -69,37 +84,37 @@ func (s *Store) SendMessage(ctx context.Context, userID, conversationID int64, d
 	err = tx.GetContext(ctx, &message, selectMessage+`
 		WHERE conversation_id = ? AND sender_id = ? AND client_msg_id = ?`, conversationID, userID, draft.clientMsgID)
 	if err == nil {
-		return message, nil
+		return SendResult{Message: message, RecipientID: recipientID}, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return Message{}, err
+		return SendResult{}, err
 	}
 
 	message = Message{
 		ConversationID: conversationID, SenderID: userID, ClientMsgID: draft.clientMsgID,
-		Seq: lastSeq + 1, Content: draft.content, CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
+		Seq: conversation.LastSeq + 1, Content: draft.content, CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
 	}
 	result, err := tx.ExecContext(ctx, `
 		INSERT INTO messages (conversation_id, sender_id, client_msg_id, seq, content, created_at)
 		VALUES (?, ?, ?, ?, ?, ?)`, conversationID, userID, draft.clientMsgID, message.Seq, draft.content, message.CreatedAt)
 	if err != nil {
-		return Message{}, err
+		return SendResult{}, err
 	}
 	message.ID, err = result.LastInsertId()
 	if err != nil {
-		return Message{}, err
+		return SendResult{}, err
 	}
 	// 消息和会话游标在同一事务里更新，提交成功后才确认发送。
 	_, err = tx.ExecContext(ctx, `
 		UPDATE conversations SET last_seq = ?, last_activity_at = ? WHERE id = ?`,
 		message.Seq, message.CreatedAt, conversationID)
 	if err != nil {
-		return Message{}, err
+		return SendResult{}, err
 	}
 	if err = tx.Commit(); err != nil {
-		return Message{}, err
+		return SendResult{}, err
 	}
-	return message, nil
+	return SendResult{Message: message, RecipientID: recipientID, Created: true}, nil
 }
 
 // History 在 beforeSeq 为 0 时从最新消息开始查。

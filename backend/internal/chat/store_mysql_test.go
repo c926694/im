@@ -81,20 +81,27 @@ func TestStoreMySQL(t *testing.T) {
 		t.Fatalf("outsider read error = %v", err)
 	}
 
-	var retries [8]chat.Message
+	var retries [8]chat.SendResult
 	runConcurrently(t, len(retries), func(i int) error {
 		message, err := store.SendMessage(ctx, alice, conversationID, draft)
 		retries[i] = message
 		return err
 	})
-	first := retries[0]
+	first := retries[0].Message
 	if first.ID == 0 || first.Seq != 1 || first.ClientMsgID != clientMsgID || first.Content != " 你好 👋 " || first.CreatedAt.Location() != time.UTC {
 		t.Fatalf("unexpected first message: %+v", first)
 	}
+	created := 0
 	for _, retry := range retries {
-		if retry != first {
+		if retry.Message != first || retry.RecipientID != bob {
 			t.Fatalf("retry returned %+v, want %+v", retry, first)
 		}
+		if retry.Created {
+			created++
+		}
+	}
+	if created != 1 {
+		t.Fatalf("created %d messages, want 1", created)
 	}
 	var drafts [8]chat.MessageDraft
 	for i := range drafts {
@@ -106,7 +113,7 @@ func TestStoreMySQL(t *testing.T) {
 	})
 	// The same client ID belongs to a different request when the sender differs.
 	reply, err := store.SendMessage(ctx, bob, conversationID, messageDraft(t, clientMsgID, "reply"))
-	if err != nil || reply.Seq != 10 {
+	if err != nil || reply.Message.Seq != 10 || reply.RecipientID != alice || !reply.Created {
 		t.Fatalf("reply = %+v, err = %v; want seq 10", reply, err)
 	}
 
@@ -135,7 +142,7 @@ func TestStoreMySQL(t *testing.T) {
 	if err != nil || len(bobs) != 1 {
 		t.Fatalf("Bob's conversations = %+v, err = %v", bobs, err)
 	}
-	if item := bobs[0]; item.ID != conversationID || item.PeerUserID != alice || item.LastReadSeq != 2 || item.LastSeq != 10 || item.UnreadCount != 7 || !item.LastActivityAt.Equal(reply.CreatedAt) {
+	if item := bobs[0]; item.ID != conversationID || item.PeerUserID != alice || item.LastReadSeq != 2 || item.LastSeq != 10 || item.UnreadCount != 7 || !item.LastActivityAt.Equal(reply.Message.CreatedAt) {
 		t.Fatalf("unexpected Bob summary: %+v", item)
 	}
 	alices, err := store.ListConversations(ctx, alice)
