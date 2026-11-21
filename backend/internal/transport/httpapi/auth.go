@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"errors"
-	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -54,36 +53,36 @@ func (h *handler) register(c *gin.Context) {
 		Nickname string `json:"nickname"`
 	}
 	if err := c.ShouldBindJSON(&form); err != nil || !form.credentials.normalize() {
-		reject(c, http.StatusBadRequest, "invalid_registration")
+		reject(c, "invalid_registration")
 		return
 	}
 	nickname := strings.TrimSpace(form.Nickname)
 	if nickname == "" || utf8.RuneCountInString(nickname) > 64 {
-		reject(c, http.StatusBadRequest, "invalid_registration")
+		reject(c, "invalid_registration")
 		return
 	}
 	userID, err := h.users.Register(c.Request.Context(), form.Username, *form.Password, nickname)
 	if errors.Is(err, user.ErrUsernameTaken) {
-		reject(c, http.StatusConflict, "username_taken")
+		reject(c, "username_taken")
 		return
 	}
 	if err != nil {
 		internalError(c, err)
 		return
 	}
-	c.JSON(http.StatusCreated, gin.H{"user_id": strconv.FormatInt(userID, 10)})
+	respondSuccess(c, gin.H{"user_id": strconv.FormatInt(userID, 10)})
 }
 
 func (h *handler) login(c *gin.Context) {
 	var form credentials
 	if err := c.ShouldBindJSON(&form); err != nil || !form.normalize() {
-		reject(c, http.StatusBadRequest, "invalid_login")
+		reject(c, "invalid_login")
 		return
 	}
 	// 先验证数据库里的密码哈希，再签发带用户 ID 的访问凭证。
 	userID, err := h.users.Login(c.Request.Context(), form.Username, *form.Password)
 	if errors.Is(err, user.ErrInvalidCredentials) {
-		reject(c, http.StatusUnauthorized, "invalid_credentials")
+		reject(c, "invalid_credentials")
 		return
 	}
 	if err != nil {
@@ -102,7 +101,7 @@ func (h *handler) login(c *gin.Context) {
 		return
 	}
 	c.Header("Cache-Control", "no-store")
-	c.JSON(http.StatusOK, gin.H{
+	respondSuccess(c, gin.H{
 		"user_id":      subject,
 		"access_token": token,
 		"expires_in":   int(accessTTL / time.Second),
@@ -112,7 +111,7 @@ func (h *handler) login(c *gin.Context) {
 func (h *handler) requireBearer(c *gin.Context) {
 	scheme, value, _ := strings.Cut(c.GetHeader("Authorization"), " ")
 	if !strings.EqualFold(scheme, "Bearer") || value == "" {
-		reject(c, http.StatusUnauthorized, "invalid_token")
+		reject(c, "invalid_token")
 		return
 	}
 	claims := jwt.RegisteredClaims{}
@@ -120,12 +119,12 @@ func (h *handler) requireBearer(c *gin.Context) {
 		return h.jwtSecret, nil
 	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}), jwt.WithExpirationRequired())
 	if err != nil {
-		reject(c, http.StatusUnauthorized, "invalid_token")
+		reject(c, "invalid_token")
 		return
 	}
 	userID, err := strconv.ParseInt(claims.Subject, 10, 64)
 	if err != nil || userID <= 0 {
-		reject(c, http.StatusUnauthorized, "invalid_token")
+		reject(c, "invalid_token")
 		return
 	}
 	c.Set(principalKey, principal{userID: userID, expiresAt: claims.ExpiresAt.Time})

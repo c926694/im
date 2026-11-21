@@ -48,7 +48,7 @@ func (h *handler) issueWSTicket(c *gin.Context) {
 		expiresAt = identity.expiresAt.UTC()
 	}
 	if !now.Before(expiresAt) {
-		reject(c, http.StatusUnauthorized, "invalid_token")
+		reject(c, "invalid_token")
 		return
 	}
 
@@ -61,14 +61,14 @@ func (h *handler) issueWSTicket(c *gin.Context) {
 	// 票据只继承登录身份，不接受客户端传入用户 ID。
 	h.tickets.reserve(value, principal{userID: identity.userID, expiresAt: expiresAt}, now)
 	c.Header("Cache-Control", "no-store")
-	c.JSON(http.StatusOK, gin.H{"ticket": value, "expires_at": expiresAt})
+	respondSuccess(c, gin.H{"ticket": value, "expires_at": expiresAt})
 }
 
 func (h *handler) openWebSocket(c *gin.Context) {
 	// 查找和删除在同一把锁内；即使后续升级失败，同一票据也不能重用。
 	userID, ok := h.tickets.consume(c.Query("ticket"), time.Now())
 	if !ok {
-		reject(c, http.StatusUnauthorized, "invalid_ws_ticket")
+		c.AbortWithStatus(http.StatusUnauthorized)
 		return
 	}
 	h.hub.Serve(c.Writer, c.Request, userID)

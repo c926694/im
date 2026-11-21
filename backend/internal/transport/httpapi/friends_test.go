@@ -51,10 +51,10 @@ func TestFriendRequestsMySQL(t *testing.T) {
 	if first.ID == "" || duplicate != first || first.Peer != profile || first.Direction != "outgoing" {
 		t.Fatalf("first request = %+v, duplicate = %+v", first, duplicate)
 	}
-	var conflict struct{ Error string }
+	var conflict apiResponse
 	request(t, server, http.MethodPost, path, bob.Token, map[string]string{"peer_username": alice.Username}, http.StatusConflict, &conflict)
-	if conflict.Error != "incoming_friend_request" {
-		t.Fatalf("incoming request conflict = %q", conflict.Error)
+	if conflict.Code != codeResourceConflict || conflict.Msg == "" {
+		t.Fatalf("incoming request conflict = %+v", conflict)
 	}
 	var list []friendRequestResponse
 	request(t, server, http.MethodGet, path, bob.Token, nil, http.StatusOK, &list)

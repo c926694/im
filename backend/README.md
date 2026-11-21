@@ -30,7 +30,7 @@ go run ./cmd/im
 
 | 方法和路径 | 请求和结果 |
 | --- | --- |
-| `POST /api/v1/auth/register` | JSON：`username`、`password`、`nickname`。返回 `201` 和 `user_id`。 |
+| `POST /api/v1/auth/register` | JSON：`username`、`password`、`nickname`。返回 `200` 和 `user_id`。 |
 | `POST /api/v1/auth/login` | JSON：`username`、`password`。返回 `user_id`、`access_token`、`expires_in`（秒，有效期 1 小时）。 |
 | `POST /api/v1/ws/tickets` | 返回 `ticket` 和 `expires_at`。用新票据连接 `GET /ws?ticket=...`。 |
 | `GET /api/v1/users/by-username?username=xiaoli` | 按完整用户名查询公开资料，返回 `id`、`username` 和 `nickname`。 |
@@ -40,11 +40,12 @@ go run ./cmd/im
 | `PATCH /api/v1/friend-requests/:id` | 由接收人提交 `status`：`accepted` 同意或 `rejected` 拒绝。 |
 | `DELETE /api/v1/friends/:id` | `id` 为对方的用户 ID；解除好友并保留历史。 |
 | `POST /api/v1/conversations/direct` | JSON：`{"peer_username":"xiaoli"}`。双方互为好友时，返回新建或已有会话的 `id`。 |
-| `GET /api/v1/conversations` | 返回会话摘要，包括对方 ID、昵称 `peer_nickname`、好友状态 `is_friend`、最新序号和未读数。 |
+| `GET /api/v1/conversations` | 返回对方 ID、昵称 `peer_nickname`、好友状态 `is_friend`、最新序号 `last_seq`、个人已读序号 `last_read_seq` 和未读数 `unread_count`。 |
 | `POST /api/v1/conversations/:id/messages` | JSON：`client_msg_id`（UUID）、`content`。返回已保存的消息；重试复用同一个 UUID。 |
 | `GET /api/v1/conversations/:id/messages` | 返回消息数组。默认倒序查历史；`before_seq` 查询更早消息；`after_seq` 正序补拉，`0` 表示从第一条开始。两个游标不能同时传。`limit` 默认 50、最多 100。 |
+| `POST /api/v1/conversations/:id/read` | JSON：`{"seq":"12"}`。推进当前成员的已读序号，成功返回 `data: null`；序号不能超过 `last_seq`，重复或较早的请求不会使进度倒退。 |
 
-除注册和登录外，HTTP API 带 `Authorization: Bearer <access_token>`。WebSocket 握手只使用票据。账号使用 1–32 位 ASCII 字母、数字或下划线（转小写）；昵称 1–64 个字符。注册和登录均需提供 `password` 字符串，允许空字符串，不限制密码的长度或字符组合，保留首尾空格。新账号使用 Argon2id 保存密码哈希，已有 bcrypt 账号可以继续登录。JSON 里的用户、会话和消息 ID 以及消息序号均为十进制字符串，HTTP API 错误返回 `{"error":"错误码"}`。
+除注册和登录外，HTTP API 带 `Authorization: Bearer <access_token>`。普通 JSON 接口统一使用 HTTP `200`，响应格式为 `{"code":0,"msg":"success","data":{}}`；业务失败也使用 HTTP `200`，通过 `code` 和 `msg` 判断结果。WebSocket 握手单独遵循协议：成功返回 `101`，票据无效返回 `401`，同源校验失败返回 `403`。账号使用 1–32 位 ASCII 字母、数字或下划线（转小写）；昵称 1–64 个字符。注册和登录均需提供 `password` 字符串，允许空字符串，不限制密码的长度或字符组合，保留首尾空格。新账号使用 Argon2id 保存密码哈希，已有 bcrypt 账号可以继续登录。JSON 里的用户、会话和消息 ID 以及消息序号均为十进制字符串。错误码 `0` 表示成功，`40000` 段表示业务错误，`50000` 表示服务错误。
 
 ## 数据表
 
@@ -62,7 +63,7 @@ go run ./cmd/im
 
 新会话的 `last_seq` 和成员的 `last_read_seq` 默认都是 `0`，分别表示没有消息和未读到任何消息。消息表的 `seq` 没有默认值，第一条消息写入 `1`。
 
-`internal/chat` 提供建聊、发消息、会话列表、历史分页、增量补拉和标记已读。Gin 入口用 `NewMessageDraft` 校验消息，并把登录用户的 ID 传给数据层，不从消息请求体取发送人。本阶段不开放已读接口。
+`internal/chat` 提供建聊、发消息、会话列表、历史分页、增量补拉和标记已读。Gin 入口用 `NewMessageDraft` 校验消息，并通过登录身份取得发送人。未读数只统计个人已读序号之后由对方发送的消息。
 
 [数据库迁移及测试方法](../docker/README.md#初始化数据库和运行集成测试)
 

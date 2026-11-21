@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useReducer, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useState, useRef } from "react";
 import { chatAPI } from "./api";
 import type { Conversation, Session } from "./api";
 import { Chat } from "./Chat";
@@ -22,35 +22,41 @@ export function Workspace({ session, onLogout, onExpired }: {
   const [view, setView] = useState<"chats" | "friends" | "requests">("chats");
   const [selected, setSelected] = useState<string | null>(null);
   const [timelines, dispatch] = useReducer(timelinesReducer, {});
+  const conversationRefreshTimer = useRef<number | undefined>(undefined);
+  const listRequest = useRef(0);
+  const appliedListRequest = useRef(0);
 
   const loadConversations = useCallback(async (signal?: AbortSignal) => {
+    const request = ++listRequest.current;
     try {
       const incoming = await api.conversations(signal);
-      // 刷新列表期间也会收到推送，保留序号更新的会话活动时间。
-      setConversations((current) => {
-        const byID = new Map(current.map((conversation) => [conversation.id, conversation]));
-        for (const conversation of incoming) {
-          const existing = byID.get(conversation.id);
-          if (!existing || BigInt(conversation.last_seq) >= BigInt(existing.last_seq)) {
-            byID.set(conversation.id, conversation);
-          }
-        }
-        return [...byID.values()];
-      });
+      // 较早的列表响应可能包含相同消息序号和更早的已读进度。
+      if (signal?.aborted || request < appliedListRequest.current) return;
+      appliedListRequest.current = request;
+      setConversations(incoming);
       setListError("");
     } catch (error) {
-      if (!signal?.aborted) setListError((error as Error).message);
+      if (!signal?.aborted && request >= appliedListRequest.current) setListError((error as Error).message);
     } finally {
       if (!signal?.aborted) setLoadingList(false);
     }
   }, [api]);
+  const refreshConversationsAfterRead = useCallback(() => {
+    void loadConversations();
+  }, [loadConversations]);
+  const scheduleConversationRefresh = useCallback(() => {
+    if (conversationRefreshTimer.current !== undefined) return;
+    conversationRefreshTimer.current = window.setTimeout(() => {
+      conversationRefreshTimer.current = undefined;
+      void loadConversations();
+    }, 150);
+  }, [loadConversations]);
+
+  useEffect(() => () => window.clearTimeout(conversationRefreshTimer.current), []);
 
   const { status, epoch } = useRealtime(api, (message) => {
     dispatch({ id: message.conversation_id, source: "live", messages: [message] });
-    if (!conversations.some((conversation) => conversation.id === message.conversation_id)) {
-      // 收到列表之外的会话消息时，刷新列表以取得对方昵称。
-      void loadConversations();
-    }
+    scheduleConversationRefresh();
   });
 
   useEffect(() => {
@@ -111,6 +117,9 @@ export function Workspace({ session, onLogout, onExpired }: {
                     <strong>{conversation.peer_nickname}</strong>
                     <time dateTime={conversation.last_activity_at}>{activityTime.format(new Date(conversation.last_activity_at))}</time>
                   </span>
+                  {conversation.unread_count > 0 && <span className="unread-badge">
+                    <span className="sr-only">未读消息：</span>{conversation.unread_count}
+                  </span>}
                 </button>
               </li>
             ))}
@@ -123,7 +132,7 @@ export function Workspace({ session, onLogout, onExpired }: {
       </aside>
       {active ? <Chat key={active.id} api={api} conversation={active} timeline={timelines[active.id] ?? emptyTimeline}
         userID={session.userID} status={status} epoch={epoch} dispatch={dispatch} onBack={() => setSelected(null)}
-        onFriendshipChanged={() => void loadConversations()} />
+        onFriendshipChanged={() => void loadConversations()} onRead={refreshConversationsAfterRead} />
         : <section className="empty-workspace">
           <span className="brand-mark" aria-hidden="true" />
           <h2>选择会话</h2>

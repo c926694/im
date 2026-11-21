@@ -1,6 +1,6 @@
 import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState } from "react";
 import type { Dispatch, FormEvent } from "react";
-import { APIError, pageSize } from "./api";
+import { APIError, errorCode, pageSize } from "./api";
 import type { ChatAPI, Conversation, Draft } from "./api";
 import type { Timeline, TimelineAction } from "./timeline";
 import { statusLabels } from "./useRealtime";
@@ -8,7 +8,7 @@ import { statusLabels } from "./useRealtime";
 const messageTime = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit" });
 const messageDate = new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "long", day: "numeric" });
 
-export function Chat({ api, conversation, timeline, userID, status, epoch, dispatch, onBack, onFriendshipChanged }: {
+export function Chat({ api, conversation, timeline, userID, status, epoch, dispatch, onBack, onFriendshipChanged, onRead }: {
   api: ChatAPI;
   conversation: Conversation;
   timeline: Timeline;
@@ -18,6 +18,7 @@ export function Chat({ api, conversation, timeline, userID, status, epoch, dispa
   dispatch: Dispatch<TimelineAction>;
   onBack: () => void;
   onFriendshipChanged: () => void;
+  onRead: () => void;
 }) {
   const { id, peer_nickname: peerNickname } = conversation;
   const [historyError, setHistoryError] = useState("");
@@ -29,6 +30,10 @@ export function Chat({ api, conversation, timeline, userID, status, epoch, dispa
   const [content, setContent] = useState("");
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState("");
+  const [atBottom, setAtBottom] = useState(true);
+  const [pageVisible, setPageVisible] = useState(!document.hidden);
+  const [readError, setReadError] = useState("");
+  const [readAttempt, setReadAttempt] = useState(0);
   const draft = useRef<Draft | null>(null);
   const scroll = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
@@ -76,6 +81,26 @@ export function Chat({ api, conversation, timeline, userID, status, epoch, dispa
     });
     return () => controller.abort();
   }, [api, id, epoch, needsSync, syncAttempt, dispatch]);
+
+  useEffect(() => {
+    const onVisibilityChange = () => setPageVisible(!document.hidden);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
+  }, []);
+
+  useEffect(() => {
+    // 只上报当前页面已显示的连续消息，保留后台和查看历史时的未读进度。
+    if (!initialized || !pageVisible || !atBottom || timeline.cursor <= BigInt(conversation.last_read_seq)) return;
+    const controller = new AbortController();
+    api.markRead(id, timeline.cursor.toString(), controller.signal).then(() => {
+      if (controller.signal.aborted) return;
+      setReadError("");
+      onRead();
+    }).catch((error: Error) => {
+      if (!controller.signal.aborted) setReadError(error.message);
+    });
+    return () => controller.abort();
+  }, [api, id, initialized, timeline.cursor, atBottom, pageVisible, conversation.last_read_seq, readAttempt, onRead]);
 
   useLayoutEffect(() => {
     const viewport = scroll.current;
@@ -127,7 +152,7 @@ export function Chat({ api, conversation, timeline, userID, status, epoch, dispa
       setContent("");
     } catch (error) {
       setSendError((error as Error).message);
-      if (error instanceof APIError && error.code === "not_friends") onFriendshipChanged();
+      if (error instanceof APIError && error.code === errorCode.notFriends) onFriendshipChanged();
     } finally {
       setSending(false);
     }
@@ -148,8 +173,10 @@ export function Chat({ api, conversation, timeline, userID, status, epoch, dispa
       </header>
       <div className="chat-scroll" ref={scroll} role="region" aria-label="聊天记录" tabIndex={0} onScroll={(event) => {
         const viewport = event.currentTarget;
-        stickToBottom.current = viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 72;
-        if (viewport.scrollTop < 48 && !stickToBottom.current && !historyError) void loadOlder();
+        const atBottom = viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop <= 2;
+        stickToBottom.current = atBottom;
+        setAtBottom(atBottom);
+        if (viewport.scrollTop < 48 && !atBottom && !historyError) void loadOlder();
       }}>
         {!initialized && !historyError && <p className="chat-note" role="status">正在加载消息…</p>}
         {historyError && <div className="feedback chat-note" role="alert">
@@ -178,9 +205,14 @@ export function Chat({ api, conversation, timeline, userID, status, epoch, dispa
           })}
         </div>
       </div>
-      {syncError && <div className="feedback sync-feedback" role="alert">
-        <p>消息同步失败。{syncError}</p><button type="button" disabled={status !== "online"} onClick={() => setSyncAttempt((value) => value + 1)}>重试同步</button>
-      </div>}
+      <div>
+        {syncError && <div className="feedback sync-feedback" role="alert">
+          <p>消息同步失败。{syncError}</p><button type="button" disabled={status !== "online"} onClick={() => setSyncAttempt((value) => value + 1)}>重试同步</button>
+        </div>}
+        {readError && <div className="feedback sync-feedback" role="alert">
+          <p>已读状态更新失败。{readError}</p><button type="button" onClick={() => setReadAttempt((value) => value + 1)}>重试更新</button>
+        </div>}
+      </div>
       {conversation.is_friend ? <form className="composer" onSubmit={send}>
         <label htmlFor="message-content">消息</label>
         <div className="composer-fields">

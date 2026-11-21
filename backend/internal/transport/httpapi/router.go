@@ -3,7 +3,6 @@ package httpapi
 import (
 	"io"
 	"log/slog"
-	"net/http"
 
 	"github.com/gin-gonic/gin"
 
@@ -28,10 +27,18 @@ func NewRouter(users *user.Store, chatService *chat.Service, friends *friendship
 	// /ws 的查询参数里有票据，不能使用会打印原始请求的日志或 Recovery。
 	router.Use(gin.CustomRecoveryWithWriter(io.Discard, func(c *gin.Context, _ any) {
 		slog.Error("request panicked", "route", c.FullPath())
-		reject(c, http.StatusInternalServerError, "internal_error")
+		reject(c, "internal_error")
 	}))
 	router.RedirectTrailingSlash = false
-	router.GET("/healthz", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	router.NoRoute(func(c *gin.Context) {
+		reject(c, "route_not_found")
+	})
+	router.NoMethod(func(c *gin.Context) {
+		reject(c, "invalid_request")
+	})
+	router.GET("/healthz", func(c *gin.Context) {
+		respondSuccess(c, gin.H{"status": "ok"})
+	})
 	router.GET("/ws", h.openWebSocket)
 
 	api := router.Group("/api/v1")
@@ -50,14 +57,11 @@ func NewRouter(users *user.Store, chatService *chat.Service, friends *friendship
 	protected.GET("/conversations", h.listConversations)
 	protected.POST("/conversations/:id/messages", h.sendMessage)
 	protected.GET("/conversations/:id/messages", h.listMessages)
+	protected.POST("/conversations/:id/read", h.markRead)
 	return router
-}
-
-func reject(c *gin.Context, status int, code string) {
-	c.AbortWithStatusJSON(status, gin.H{"error": code})
 }
 
 func internalError(c *gin.Context, err error) {
 	slog.Error("request failed", "route", c.FullPath(), "error", err)
-	reject(c, http.StatusInternalServerError, "internal_error")
+	reject(c, "internal_error")
 }

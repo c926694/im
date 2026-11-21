@@ -3,7 +3,6 @@ package httpapi
 import (
 	"errors"
 	"log/slog"
-	"net/http"
 	"net/url"
 	"strconv"
 	"time"
@@ -34,12 +33,12 @@ func (h *handler) createDirect(c *gin.Context) {
 		PeerUsername string `json:"peer_username"`
 	}
 	if err := c.ShouldBindJSON(&form); err != nil {
-		reject(c, http.StatusBadRequest, "invalid_peer_username")
+		reject(c, "invalid_peer_username")
 		return
 	}
 	username, ok := normalizeUsername(form.PeerUsername)
 	if !ok {
-		reject(c, http.StatusBadRequest, "invalid_peer_username")
+		reject(c, "invalid_peer_username")
 		return
 	}
 	ctx := c.Request.Context()
@@ -55,7 +54,7 @@ func (h *handler) createDirect(c *gin.Context) {
 		chatError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"id": strconv.FormatInt(id, 10)})
+	respondSuccess(c, gin.H{"id": strconv.FormatInt(id, 10)})
 }
 
 func (h *handler) listConversations(c *gin.Context) {
@@ -98,7 +97,7 @@ func (h *handler) listConversations(c *gin.Context) {
 			LastActivityAt: conversation.LastActivityAt, UnreadCount: conversation.UnreadCount,
 		}
 	}
-	c.JSON(http.StatusOK, response)
+	respondSuccess(c, response)
 }
 
 func (h *handler) sendMessage(c *gin.Context) {
@@ -111,7 +110,7 @@ func (h *handler) sendMessage(c *gin.Context) {
 		Content     string `json:"content"`
 	}
 	if err := c.ShouldBindJSON(&form); err != nil {
-		reject(c, http.StatusBadRequest, "invalid_message")
+		reject(c, "invalid_message")
 		return
 	}
 	draft, err := chat.NewMessageDraft(form.ClientMsgID, form.Content)
@@ -132,7 +131,7 @@ func (h *handler) sendMessage(c *gin.Context) {
 			slog.Warn("message saved but push failed", "message_id", result.Message.ID, "error", err)
 		}
 	}
-	c.JSON(http.StatusOK, messageResponse(result.Message))
+	respondSuccess(c, messageResponse(result.Message))
 }
 
 func (h *handler) listMessages(c *gin.Context) {
@@ -142,7 +141,7 @@ func (h *handler) listMessages(c *gin.Context) {
 	}
 	page, ok := parseMessagePage(c.Request.URL.Query())
 	if !ok {
-		reject(c, http.StatusBadRequest, "invalid_pagination")
+		reject(c, "invalid_pagination")
 		return
 	}
 
@@ -163,7 +162,27 @@ func (h *handler) listMessages(c *gin.Context) {
 	for i, message := range messages {
 		response[i] = messageResponse(message)
 	}
-	c.JSON(http.StatusOK, response)
+	respondSuccess(c, response)
+}
+
+// markRead 通过登录身份更新会话成员的已读序号。
+func (h *handler) markRead(c *gin.Context) {
+	conversationID, ok := conversationParam(c)
+	if !ok {
+		return
+	}
+	var form struct {
+		Seq *int64 `json:"seq,string"`
+	}
+	if err := c.ShouldBindJSON(&form); err != nil || form.Seq == nil {
+		reject(c, "invalid_read_seq")
+		return
+	}
+	if err := h.chat.MarkRead(c.Request.Context(), authenticated(c).userID, conversationID, *form.Seq); err != nil {
+		chatError(c, err)
+		return
+	}
+	respondSuccess(c, nil)
 }
 
 type messagePage struct {
@@ -202,7 +221,7 @@ func parseMessagePage(query url.Values) (messagePage, bool) {
 func conversationParam(c *gin.Context) (int64, bool) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {
-		reject(c, http.StatusBadRequest, "invalid_conversation_id")
+		reject(c, "invalid_conversation_id")
 		return 0, false
 	}
 	return id, true
@@ -211,19 +230,21 @@ func conversationParam(c *gin.Context) (int64, bool) {
 func chatError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, chat.ErrSelfConversation):
-		reject(c, http.StatusBadRequest, "self_conversation")
+		reject(c, "self_conversation")
 	case errors.Is(err, chat.ErrUserNotFound), errors.Is(err, user.ErrUserNotFound):
-		reject(c, http.StatusNotFound, "user_not_found")
+		reject(c, "user_not_found")
 	case errors.Is(err, chat.ErrNotMember):
-		reject(c, http.StatusForbidden, "not_conversation_member")
+		reject(c, "not_conversation_member")
 	case errors.Is(err, friendship.ErrNotFriends):
-		reject(c, http.StatusForbidden, "not_friends")
+		reject(c, "not_friends")
 	case errors.Is(err, chat.ErrInvalidClientMsgID):
-		reject(c, http.StatusBadRequest, "invalid_client_msg_id")
+		reject(c, "invalid_client_msg_id")
 	case errors.Is(err, chat.ErrInvalidContent):
-		reject(c, http.StatusBadRequest, "invalid_content")
+		reject(c, "invalid_content")
+	case errors.Is(err, chat.ErrInvalidReadSeq):
+		reject(c, "invalid_read_seq")
 	case errors.Is(err, chat.ErrInvalidPageSize):
-		reject(c, http.StatusBadRequest, "invalid_pagination")
+		reject(c, "invalid_pagination")
 	default:
 		internalError(c, err)
 	}

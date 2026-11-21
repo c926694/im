@@ -45,7 +45,23 @@ type messageEvent struct {
 	Data messageResponse `json:"data"`
 }
 
+type apiResponse struct {
+	Code int             `json:"code"`
+	Msg  string          `json:"msg"`
+	Data json.RawMessage `json:"data"`
+}
+
 var testSecret = []byte("test-only-jwt-key-with-at-least-32-bytes")
+
+func TestHealthResponse(t *testing.T) {
+	hub := realtime.NewHub()
+	server := testServer(t, NewRouter(nil, nil, nil, hub, testSecret), hub)
+	var health apiResponse
+	request(t, server, http.MethodGet, "/healthz", "", nil, http.StatusOK, &health)
+	if health.Code != codeSuccess || health.Msg != "success" || string(health.Data) != `{"status":"ok"}` {
+		t.Fatalf("health response = %+v", health)
+	}
+}
 
 func TestDirectChatMySQL(t *testing.T) {
 	dsn := os.Getenv("IM_TEST_MYSQL_DSN")
@@ -145,6 +161,28 @@ func TestDirectChatMySQL(t *testing.T) {
 		t.Fatalf("unexpected history page: %+v", missed)
 	}
 	assertPush(t, events, send(t, server, path, alice.Token, 5))
+	assertReadProgress(t, server, alice.Token, 0, 0)
+	assertReadProgress(t, server, bob.Token, 0, 5)
+	readPath := "/api/v1/conversations/" + conversation.ID + "/read"
+	var read apiResponse
+	request(t, server, http.MethodPost, readPath, bob.Token, map[string]string{"seq": "3"}, http.StatusOK, &read)
+	if string(read.Data) != "null" {
+		t.Fatalf("mark read response data = %s, want null", read.Data)
+	}
+	assertReadProgress(t, server, bob.Token, 3, 2)
+	for _, seq := range []string{"3", "1"} {
+		request(t, server, http.MethodPost, readPath, bob.Token, map[string]string{"seq": seq}, http.StatusOK, nil)
+	}
+	request(t, server, http.MethodPost, readPath, bob.Token, map[string]string{"seq": "6"}, http.StatusBadRequest, &read)
+	if read.Code != codeInvalidRequest {
+		t.Fatalf("out-of-range read code = %d, want %d", read.Code, codeInvalidRequest)
+	}
+	request(t, server, http.MethodPost, readPath, outsider.Token, map[string]string{"seq": "5"}, http.StatusForbidden, &read)
+	if read.Code != codeNotConversationUser {
+		t.Fatalf("non-member read code = %d, want %d", read.Code, codeNotConversationUser)
+	}
+	assertReadProgress(t, server, bob.Token, 3, 2)
+	assertReadProgress(t, server, alice.Token, 0, 0)
 
 	request(t, server, http.MethodDelete, "/api/v1/friends/"+alice.ID, bob.Token, nil, http.StatusOK, nil)
 	request(t, server, http.MethodPost, directPath, alice.Token,
@@ -173,6 +211,20 @@ func TestDirectChatMySQL(t *testing.T) {
 		t.Fatalf("refriended conversation = %s, want %s", reverse.ID, conversation.ID)
 	}
 	assertPush(t, events, send(t, server, path, alice.Token, 6))
+	send(t, server, path, bob.Token, 7)
+	assertReadProgress(t, server, alice.Token, 0, 1)
+	assertReadProgress(t, server, bob.Token, 3, 3)
+	request(t, server, http.MethodPost, readPath, bob.Token, map[string]string{"seq": "7"}, http.StatusOK, nil)
+	assertReadProgress(t, server, bob.Token, 7, 0)
+}
+
+func assertReadProgress(t *testing.T, server *httptest.Server, token string, seq, unread int64) {
+	t.Helper()
+	var conversations []conversationResponse
+	request(t, server, http.MethodGet, "/api/v1/conversations", token, nil, http.StatusOK, &conversations)
+	if len(conversations) != 1 || conversations[0].LastReadSeq != seq || conversations[0].UnreadCount != unread {
+		t.Fatalf("conversations = %+v, want one conversation with read seq %d and unread count %d", conversations, seq, unread)
+	}
 }
 
 func befriend(t *testing.T, server *httptest.Server, from, to testAccount) {
@@ -284,16 +336,33 @@ func request(t *testing.T, server *httptest.Server, method, path, token string, 
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != status {
+	if resp.StatusCode != http.StatusOK {
 		payload, _ := io.ReadAll(resp.Body)
-		t.Fatalf("%s %s: status %d, want %d; body %s", method, path, resp.StatusCode, status, payload)
+		t.Fatalf("%s %s: status %d, want 200; body %s", method, path, resp.StatusCode, payload)
 	}
-	if out != nil {
-		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-			t.Fatal(err)
-		}
-	} else {
-		io.Copy(io.Discard, resp.Body)
+	var envelope apiResponse
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		t.Fatal(err)
+	}
+	wantSuccess := status == http.StatusOK || status == http.StatusCreated
+	if wantSuccess && envelope.Code != codeSuccess {
+		t.Fatalf("%s %s: code %d, want success; msg %s", method, path, envelope.Code, envelope.Msg)
+	}
+	if !wantSuccess && envelope.Code == codeSuccess {
+		t.Fatalf("%s %s: code %d, want business error; msg %s", method, path, envelope.Code, envelope.Msg)
+	}
+	if out == nil {
+		return
+	}
+	if full, ok := out.(*apiResponse); ok {
+		*full = envelope
+		return
+	}
+	if string(envelope.Data) == "null" {
+		return
+	}
+	if err := json.Unmarshal(envelope.Data, out); err != nil {
+		t.Fatal(err)
 	}
 }
 
