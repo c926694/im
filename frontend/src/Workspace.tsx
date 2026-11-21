@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useReducer, useState } from "react";
-import type { FormEvent } from "react";
 import { chatAPI } from "./api";
 import type { Conversation, Session } from "./api";
 import { Chat } from "./Chat";
+import { Friends } from "./Friends";
 import { emptyTimeline, timelinesReducer } from "./timeline";
 import { statusLabels, useRealtime } from "./useRealtime";
 
@@ -19,8 +19,7 @@ export function Workspace({ session, onLogout, onExpired }: {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [loadingList, setLoadingList] = useState(true);
   const [listError, setListError] = useState("");
-  const [creating, setCreating] = useState(false);
-  const [createError, setCreateError] = useState("");
+  const [view, setView] = useState<"chats" | "friends" | "requests">("chats");
   const [selected, setSelected] = useState<string | null>(null);
   const [timelines, dispatch] = useReducer(timelinesReducer, {});
 
@@ -61,23 +60,12 @@ export function Workspace({ session, onLogout, onExpired }: {
     return () => controller.abort();
   }, [epoch, loadConversations]);
 
-  async function openDirect(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const form = event.currentTarget;
-    const username = String(new FormData(form).get("peer_username"));
-    setCreating(true);
-    setCreateError("");
-    try {
-      const result = await api.direct(username);
-      // 列表接口提供会话的昵称和活动时间，刷新后打开目标会话。
-      await loadConversations();
-      setSelected(result.id);
-      form.reset();
-    } catch (error) {
-      setCreateError((error as Error).message);
-    } finally {
-      setCreating(false);
-    }
+  async function openDirect(username: string) {
+    const result = await api.direct(username);
+    // 从会话列表取得昵称和发送权限后，再打开目标聊天。
+    await loadConversations();
+    setSelected(result.id);
+    setView("chats");
   }
 
   const ordered = conversations.map((conversation) => {
@@ -85,24 +73,25 @@ export function Workspace({ session, onLogout, onExpired }: {
     if (!latest || BigInt(latest.seq) <= BigInt(conversation.last_seq)) return conversation;
     return { ...conversation, last_seq: latest.seq, last_activity_at: latest.created_at };
   }).sort((a, b) => Date.parse(b.last_activity_at) - Date.parse(a.last_activity_at));
-  const active = ordered.find((conversation) => conversation.id === selected);
+  const active = view === "chats" ? ordered.find((conversation) => conversation.id === selected) : undefined;
 
   return (
     <main className="workspace" data-thread-open={Boolean(active)}>
-      <aside className="sidebar" aria-label="会话列表">
+      <aside className="sidebar" aria-label="聊天导航">
         <header className="sidebar-header">
           <div className="wordmark"><span className="brand-mark" aria-hidden="true" /><h1>回声</h1></div>
           <span className="connection" data-status={status} role="status">{statusLabels[status]}</span>
         </header>
-        <form className="direct-form" onSubmit={openDirect}>
-          <label htmlFor="peer-username">对方的用户名</label>
-          <div className="direct-fields">
-            <input id="peer-username" name="peer_username" autoCapitalize="none" spellCheck={false} required disabled={creating} />
-            <button type="submit" disabled={creating}>{creating ? "正在打开…" : "发起单聊"}</button>
-          </div>
-          {createError && <p className="error" role="alert">{createError}</p>}
-        </form>
-        <section className="conversations" aria-labelledby="conversations-title">
+        <nav className="sidebar-nav" aria-label="聊天功能">
+          <button type="button" aria-pressed={view === "chats"} onClick={() => {
+            setView("chats");
+            void loadConversations();
+          }}>会话</button>
+          <button type="button" aria-pressed={view === "friends"} onClick={() => setView("friends")}>好友</button>
+          <button type="button" aria-pressed={view === "requests"} onClick={() => setView("requests")}>好友申请</button>
+        </nav>
+        {view !== "chats" ? <Friends key={view} api={api} userID={session.userID} view={view}
+          onOpen={openDirect} onChanged={() => void loadConversations()} /> : <section className="conversations" aria-labelledby="conversations-title">
           <h2 id="conversations-title">会话</h2>
           {listError && <div className="feedback" role="alert">
             <p>{listError}</p><button type="button" onClick={() => void loadConversations()}>刷新会话</button>
@@ -113,7 +102,10 @@ export function Workspace({ session, onLogout, onExpired }: {
             {ordered.map((conversation) => (
               <li key={conversation.id}>
                 <button type="button" className="conversation" aria-current={selected === conversation.id ? "true" : undefined}
-                  onClick={() => setSelected(conversation.id)}>
+                  onClick={() => {
+                    setSelected(conversation.id);
+                    void loadConversations();
+                  }}>
                   <span className="avatar" aria-hidden="true">{Array.from(conversation.peer_nickname)[0]}</span>
                   <span className="conversation-label">
                     <strong>{conversation.peer_nickname}</strong>
@@ -123,18 +115,19 @@ export function Workspace({ session, onLogout, onExpired }: {
               </li>
             ))}
           </ul>
-        </section>
+        </section>}
         <footer className="account">
           <span><span>我的用户名</span><strong>{session.username}</strong></span>
           <button type="button" onClick={onLogout}>退出</button>
         </footer>
       </aside>
       {active ? <Chat key={active.id} api={api} conversation={active} timeline={timelines[active.id] ?? emptyTimeline}
-        userID={session.userID} status={status} epoch={epoch} dispatch={dispatch} onBack={() => setSelected(null)} />
+        userID={session.userID} status={status} epoch={epoch} dispatch={dispatch} onBack={() => setSelected(null)}
+        onFriendshipChanged={() => void loadConversations()} />
         : <section className="empty-workspace">
           <span className="brand-mark" aria-hidden="true" />
           <h2>选择会话</h2>
-          <p>也可以输入对方的用户名，发起单聊。</p>
+          <p>可以从好友列表发起单聊。</p>
         </section>}
     </main>
   );

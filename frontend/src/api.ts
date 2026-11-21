@@ -7,10 +7,14 @@ export type Session = {
 
 export type Conversation = {
   id: string;
+  is_friend: boolean;
   peer_nickname: string;
   last_seq: string;
   last_activity_at: string;
 };
+
+export type Profile = { id: string; username: string; nickname: string };
+export type FriendRequest = { id: string; peer: Profile; direction: "incoming" | "outgoing" };
 
 export type Message = {
   id: string;
@@ -34,12 +38,17 @@ const errorMessages: Record<string, string> = {
   invalid_peer_username: "用户名需使用 1 至 32 个字母、数字或下划线。",
   self_conversation: "无法和自己发起单聊。",
   user_not_found: "没有找到这个用户名，请核对后重试。",
+  self_friend_request: "无法向自己发送好友申请。",
+  incoming_friend_request: "对方已向你发送申请，请在收到的申请中处理。",
+  already_friends: "你们已经是好友。",
+  friend_request_unavailable: "这条申请已失效，请刷新申请列表。",
+  not_friends: "成为好友后才能发送消息。",
   not_conversation_member: "你没有权限访问这个会话。",
   invalid_content: "消息需要包含正文，且最多 2000 个字符。",
   internal_error: "服务暂时无法完成请求，请重试。",
 };
 
-class APIError extends Error {
+export class APIError extends Error {
   constructor(readonly code: string) {
     super(errorMessages[code] ?? "请求失败，请重试。");
   }
@@ -100,6 +109,16 @@ export function chatAPI(session: Session, onExpired: () => void) {
   }
 
   return {
+    lookupUser: (username: string) => authorized<Profile>(`/users/by-username?${new URLSearchParams({ username })}`),
+    friends: (signal: AbortSignal) => authorized<Profile[]>("/friends", { signal }),
+    friendRequests: (signal: AbortSignal) => authorized<FriendRequest[]>("/friend-requests", { signal }),
+    requestFriend: (username: string) => authorized<FriendRequest>("/friend-requests", {
+      method: "POST", body: JSON.stringify({ peer_username: username }),
+    }),
+    resolveFriend: (id: string, status: "accepted" | "rejected") => authorized<{ status: string }>(`/friend-requests/${id}`, {
+      method: "PATCH", body: JSON.stringify({ status }),
+    }),
+    removeFriend: (id: string) => authorized<{ status: string }>(`/friends/${id}`, { method: "DELETE" }),
     conversations: (signal?: AbortSignal) => authorized<Conversation[]>("/conversations", { signal }),
     direct: (peerUsername: string) => authorized<{ id: string }>("/conversations/direct", {
       method: "POST",

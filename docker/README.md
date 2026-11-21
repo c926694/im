@@ -28,23 +28,23 @@ docker compose --env-file docker/.env -f docker/compose.yaml down
 
 ## 初始化数据库和运行集成测试
 
-在宿主机运行 Go 后端时，可以用同一份 Compose 配置单独启动 MySQL。空数据卷会自动创建四张单聊表并添加业务字段备注。
+在宿主机运行 Go 后端时，可以用同一份 Compose 配置单独启动 MySQL。空数据卷会自动执行迁移，创建单聊表和好友关系表。
 
 ```sh
 docker compose --env-file docker/.env -f docker/compose.yaml up -d mysql
 ```
 
-已有四张单聊表的数据卷可单独执行字段备注迁移，保留账号、会话和消息：
+使用已有数据卷时，按版本顺序执行尚未应用的迁移。已执行 `000002` 的数据卷只需新增好友关系表，保留账号、会话和消息：
 
 ```sh
 docker compose --env-file docker/.env -f docker/compose.yaml exec -T mysql \
   sh -c 'MYSQL_PWD="$MYSQL_PASSWORD" exec mysql --default-character-set=utf8mb4 --user="$MYSQL_USER" "$MYSQL_DATABASE"' \
-  < backend/migrations/000002_direct_chat_comments.up.sql
+  < backend/migrations/000003_friendships.up.sql
 ```
 
-运行集成测试时，请选择专用测试数据库，因为测试会写入账号和消息。在 `backend/` 中运行：
+运行集成测试时，使用已执行所有 `*.up.sql` 迁移的专用测试数据库，并为测试账号授予该数据库的访问权限。测试会写入账号、好友关系和消息。在 `backend/` 中运行：
 
 ```sh
-IM_TEST_MYSQL_DSN="im_dev:im-local-app-example@tcp(127.0.0.1:3306)/im" \
+IM_TEST_MYSQL_DSN="im_dev:im-local-app-example@tcp(127.0.0.1:3306)/im_test" \
   go test -race -count=1 ./...
 ```

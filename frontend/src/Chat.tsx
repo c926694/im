@@ -1,6 +1,6 @@
 import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState } from "react";
 import type { Dispatch, FormEvent } from "react";
-import { pageSize } from "./api";
+import { APIError, pageSize } from "./api";
 import type { ChatAPI, Conversation, Draft } from "./api";
 import type { Timeline, TimelineAction } from "./timeline";
 import { statusLabels } from "./useRealtime";
@@ -8,7 +8,7 @@ import { statusLabels } from "./useRealtime";
 const messageTime = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit" });
 const messageDate = new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "long", day: "numeric" });
 
-export function Chat({ api, conversation, timeline, userID, status, epoch, dispatch, onBack }: {
+export function Chat({ api, conversation, timeline, userID, status, epoch, dispatch, onBack, onFriendshipChanged }: {
   api: ChatAPI;
   conversation: Conversation;
   timeline: Timeline;
@@ -17,6 +17,7 @@ export function Chat({ api, conversation, timeline, userID, status, epoch, dispa
   epoch: number;
   dispatch: Dispatch<TimelineAction>;
   onBack: () => void;
+  onFriendshipChanged: () => void;
 }) {
   const { id, peer_nickname: peerNickname } = conversation;
   const [historyError, setHistoryError] = useState("");
@@ -126,6 +127,7 @@ export function Chat({ api, conversation, timeline, userID, status, epoch, dispa
       setContent("");
     } catch (error) {
       setSendError((error as Error).message);
+      if (error instanceof APIError && error.code === "not_friends") onFriendshipChanged();
     } finally {
       setSending(false);
     }
@@ -179,14 +181,14 @@ export function Chat({ api, conversation, timeline, userID, status, epoch, dispa
       {syncError && <div className="feedback sync-feedback" role="alert">
         <p>消息同步失败。{syncError}</p><button type="button" disabled={status !== "online"} onClick={() => setSyncAttempt((value) => value + 1)}>重试同步</button>
       </div>}
-      <form className="composer" onSubmit={send}>
+      {conversation.is_friend ? <form className="composer" onSubmit={send}>
         <label htmlFor="message-content">消息</label>
         <div className="composer-fields">
           <textarea id="message-content" rows={2} value={content} disabled={sending} onChange={(event) => setContent(event.target.value)} />
           <button type="submit" className="primary" disabled={sending || !content.trim()}>{sending ? "正在发送…" : "发送"}</button>
         </div>
         {sendError && <p className="error" role="alert">{sendError}</p>}
-      </form>
+      </form> : <p className="composer" role="status">聊天记录仍可查看。成为好友后可以发送新消息。</p>}
     </section>
   );
 }

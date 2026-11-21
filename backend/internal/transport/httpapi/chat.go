@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/c926694/im/backend/internal/chat"
+	"github.com/c926694/im/backend/internal/friendship"
 	"github.com/c926694/im/backend/internal/realtime"
 	"github.com/c926694/im/backend/internal/user"
 )
@@ -21,6 +22,7 @@ type conversationResponse struct {
 	ID             int64     `json:"id,string"`
 	PeerUserID     int64     `json:"peer_user_id,string"`
 	PeerNickname   string    `json:"peer_nickname"`
+	IsFriend       bool      `json:"is_friend"`
 	LastSeq        int64     `json:"last_seq,string"`
 	LastReadSeq    int64     `json:"last_read_seq,string"`
 	LastActivityAt time.Time `json:"last_activity_at"`
@@ -59,7 +61,8 @@ func (h *handler) createDirect(c *gin.Context) {
 func (h *handler) listConversations(c *gin.Context) {
 	ctx := c.Request.Context()
 	// 会话查询返回对方用户 ID，供后续批量查询昵称。
-	conversations, err := h.chat.ListConversations(ctx, authenticated(c).userID)
+	userID := authenticated(c).userID
+	conversations, err := h.chat.ListConversations(ctx, userID)
 	if err != nil {
 		internalError(c, err)
 		return
@@ -69,16 +72,29 @@ func (h *handler) listConversations(c *gin.Context) {
 		peerIDs = append(peerIDs, conversation.PeerUserID)
 	}
 	// 一次查询当前列表的昵称，避免逐个查询用户。
-	nicknames, err := h.users.NicknamesByIDs(ctx, peerIDs)
+	profiles, err := h.users.ProfilesByIDs(ctx, peerIDs)
 	if err != nil {
 		internalError(c, err)
 		return
 	}
+	accepted := make(map[int64]bool)
+	if len(conversations) > 0 {
+		// 好友状态只控制发送入口，历史会话仍保留在列表中。
+		friends, err := h.friends.List(ctx, userID, friendship.Accepted)
+		if err != nil {
+			internalError(c, err)
+			return
+		}
+		for _, friend := range friends {
+			accepted[friend.PeerID] = true
+		}
+	}
 	response := make([]conversationResponse, len(conversations))
 	for i, conversation := range conversations {
 		response[i] = conversationResponse{
-			ID: conversation.ID, PeerUserID: conversation.PeerUserID, PeerNickname: nicknames[conversation.PeerUserID],
-			LastSeq: conversation.LastSeq, LastReadSeq: conversation.LastReadSeq,
+			ID: conversation.ID, PeerUserID: conversation.PeerUserID, PeerNickname: profiles[conversation.PeerUserID].Nickname,
+			IsFriend: accepted[conversation.PeerUserID],
+			LastSeq:  conversation.LastSeq, LastReadSeq: conversation.LastReadSeq,
 			LastActivityAt: conversation.LastActivityAt, UnreadCount: conversation.UnreadCount,
 		}
 	}
@@ -104,7 +120,7 @@ func (h *handler) sendMessage(c *gin.Context) {
 		return
 	}
 
-	// 发送者取自 Bearer 身份；数据层校验会话成员并提交消息事务。
+	// 发送者取自 Bearer 身份；发送服务校验会话成员与好友资格。
 	result, err := h.chat.SendMessage(c.Request.Context(), authenticated(c).userID, conversationID, draft)
 	if err != nil {
 		chatError(c, err)
@@ -200,6 +216,8 @@ func chatError(c *gin.Context, err error) {
 		reject(c, http.StatusNotFound, "user_not_found")
 	case errors.Is(err, chat.ErrNotMember):
 		reject(c, http.StatusForbidden, "not_conversation_member")
+	case errors.Is(err, friendship.ErrNotFriends):
+		reject(c, http.StatusForbidden, "not_friends")
 	case errors.Is(err, chat.ErrInvalidClientMsgID):
 		reject(c, http.StatusBadRequest, "invalid_client_msg_id")
 	case errors.Is(err, chat.ErrInvalidContent):

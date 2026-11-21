@@ -1,21 +1,16 @@
 # 后端架构
 
-首版采用**模块化单体**：一个 Go 模块、一个服务进程、一套 MySQL，Gin HTTP API 与 WebSocket 共用进程。业务按能力拆包，不在每个模块下面预建完整的 DDD 目录。目录里的 `.gitkeep` 仅用于在 Git 中保留骨架，添加实际文件后可移除。
+项目采用模块化单体：一个 Go 模块、一个服务进程、一套 MySQL，Gin HTTP API 与 WebSocket 共用进程。
 
-## 当前骨架
+## 模块职责
 
-```text
-backend/
-├── cmd/im/                     # 进程入口：启动、信号处理、优雅退出
-├── internal/
-│   ├── app/                    # 读取配置、组装依赖、注册路由
-│   ├── user/                   # 注册、登录、用户搜索
-│   ├── chat/                   # 会话、成员权限、消息、历史与已读游标
-│   ├── realtime/               # WebSocket、连接注册、心跳、有界发送队列
-│   ├── transport/httpapi/      # Gin 路由、中间件、HTTP 请求与响应转换
-│   └── platform/mysql/         # 数据库连接池与通用连接配置
-└── migrations/                # 按版本管理的数据库迁移 SQL
-```
+- `cmd/im` 和 `internal/app`：读取配置、组装依赖并启动服务。
+- `internal/user`：注册、登录、按完整用户名查找账号、批量查询资料。
+- `internal/friendship`：好友申请、关系状态和当前好友查询。
+- `internal/chat`：会话、成员权限、消息、历史和已读进度。
+- `internal/realtime`：WebSocket 连接管理、心跳和推送。
+- `internal/transport/httpapi`：Gin 路由、身份认证、请求解析和响应转换。
+- `internal/platform/mysql` 和 `migrations`：数据库连接配置和版本化 SQL 迁移。
 
 Go 模块位于 `backend/`。Gin 在同一个端口提供单聊 HTTP API 和 WebSocket 握手路由。容器启动方式见 [Docker Compose 说明](../docker/README.md)。
 
@@ -31,30 +26,37 @@ go run ./cmd/im
 
 示例 DSN 仅用于本地开发。默认监听 `127.0.0.1:8080`，可通过 `IM_HTTP_ADDR` 修改。签名密钥至少 32 字节；更换密钥会使之前签发的 token 失效。非本地环境使用 HTTPS/WSS，反向代理日志也不要记录 `/ws` 的查询参数或 `Authorization` 请求头。
 
-## 单聊 HTTP API
+## HTTP API
 
 | 方法和路径 | 请求和结果 |
 | --- | --- |
 | `POST /api/v1/auth/register` | JSON：`username`、`password`、`nickname`。返回 `201` 和 `user_id`。 |
 | `POST /api/v1/auth/login` | JSON：`username`、`password`。返回 `user_id`、`access_token`、`expires_in`（秒，有效期 1 小时）。 |
 | `POST /api/v1/ws/tickets` | 返回 `ticket` 和 `expires_at`。用新票据连接 `GET /ws?ticket=...`。 |
-| `POST /api/v1/conversations/direct` | JSON：`{"peer_username":"xiaoli"}`。按完整用户名查找，忽略大小写，返回新建或已有会话的 `id`。 |
-| `GET /api/v1/conversations` | 返回会话摘要数组，包括对方 ID、昵称 `peer_nickname`、最新序号、已读游标和未读数。 |
+| `GET /api/v1/users/by-username?username=xiaoli` | 按完整用户名查询公开资料，返回 `id`、`username` 和 `nickname`。 |
+| `GET /api/v1/friends` | 返回当前好友的公开资料。 |
+| `POST /api/v1/friend-requests` | JSON：`peer_username`。返回申请 `id`、对方资料 `peer` 和方向 `direction`。 |
+| `GET /api/v1/friend-requests` | 返回待处理申请；`direction` 表示收到（`incoming`）或发出（`outgoing`）。 |
+| `PATCH /api/v1/friend-requests/:id` | 由接收人提交 `status`：`accepted` 同意或 `rejected` 拒绝。 |
+| `DELETE /api/v1/friends/:id` | `id` 为对方的用户 ID；解除好友并保留历史。 |
+| `POST /api/v1/conversations/direct` | JSON：`{"peer_username":"xiaoli"}`。双方互为好友时，返回新建或已有会话的 `id`。 |
+| `GET /api/v1/conversations` | 返回会话摘要，包括对方 ID、昵称 `peer_nickname`、好友状态 `is_friend`、最新序号和未读数。 |
 | `POST /api/v1/conversations/:id/messages` | JSON：`client_msg_id`（UUID）、`content`。返回已保存的消息；重试复用同一个 UUID。 |
 | `GET /api/v1/conversations/:id/messages` | 返回消息数组。默认倒序查历史；`before_seq` 查询更早消息；`after_seq` 正序补拉，`0` 表示从第一条开始。两个游标不能同时传。`limit` 默认 50、最多 100。 |
 
 除注册和登录外，HTTP API 带 `Authorization: Bearer <access_token>`。WebSocket 握手只使用票据。账号使用 1–32 位 ASCII 字母、数字或下划线（转小写）；昵称 1–64 个字符。注册和登录均需提供 `password` 字符串，允许空字符串，不限制密码的长度或字符组合，保留首尾空格。新账号使用 Argon2id 保存密码哈希，已有 bcrypt 账号可以继续登录。JSON 里的用户、会话和消息 ID 以及消息序号均为十进制字符串，HTTP API 错误返回 `{"error":"错误码"}`。
 
-## 单聊数据层
+## 数据表
 
 | 表 | 一行代表什么 |
 | --- | --- |
 | `users` | 一个注册账号，存登录名、密码哈希和昵称。 |
+| `friendships` | 一对用户的好友关系和最近一次申请，两人共用一条记录。 |
 | `conversations` | 一对用户之间的聊天，存最新消息序号和活动时间。 |
 | `conversation_members` | 一个用户在某个会话中的成员关系和个人已读游标。 |
 | `messages` | 一条已保存的文本消息，按会话序号分页，按客户端 UUID 对同一发送人的重试去重。 |
 
-各表的业务字段说明见 [初始化 SQL](migrations/000001_direct_chat.up.sql) 和 [MySQL 字段备注迁移](migrations/000002_direct_chat_comments.up.sql)。
+各表和字段的中文业务说明见 [单聊字段备注迁移](migrations/000002_direct_chat_comments.up.sql) 和 [好友关系迁移](migrations/000003_friendships.up.sql)。
 
 表间只使用逻辑外键：会话的两个用户 ID 指向 `users.id`，成员的用户和会话 ID 分别指向 `users.id`、`conversations.id`，消息的会话和发送者对应一条成员记录。数据库不创建物理外键，应用负责校验用户存在和成员权限。Go 数据访问使用 `sqlx`；会话列表先查成员记录取得会话 ID，再批量查会话、未读数和对方昵称，在 Go 中按 ID 合并，不连表。
 
@@ -75,16 +77,15 @@ go run ./cmd/im
 
 - `cmd/im` 调用 `app`；`app` 负责把 HTTP 层、业务模块、数据库和连接管理器组装起来。业务模块不反向引用 `app`、Gin 处理器或 WebSocket 连接对象。
 - `httpapi` 负责鉴权中间件、参数解析和错误映射。会话成员授权由 `chat` 业务用例执行，不能仅靠 HTTP 路由拦截。
-- `chat` 在同一模块管理会话、消息与成员，因为发送消息时需要一起处理成员校验、会话序号和消息落库。首版可以用 `service.go`、`repository.go`、`mysql.go` 区分职责，业务 SQL 归业务模块，不集中堆进 `platform/mysql`。仅在需要替换实现或隔离测试时引入小接口。
+- `friendship` 和 `chat` 的 Service 负责业务规则、权限判断和事务流程，Store 执行查询及写入。处理好友申请时，带条件的更新只接受当前接收人对待处理申请的操作。
+- 建聊和发送新消息时检查好友状态。发送使用普通查询读取好友关系，以检查时的状态为准；会话行锁继续负责分配消息序号。历史和增量同步仅校验会话成员资格。
 - 首版 HTTP 发送在 MySQL 提交后返回确认，并由进程内推送路径通知在线连接；确认不等待 WebSocket 送达。实时推送失败时，客户端可在重连、发现缺口或主动同步时按会话 `seq` 从数据库补拉。
 
-## 按迭代增加的目录
+## 计划模块
 
-| 能力 | 预计落点 | 边界 |
+| 能力 | 模块 | 职责 |
 | --- | --- | --- |
-| 异步投递 | `internal/outbox`、`internal/platform/rocketmq` | 消息和待投递事件同事务落库，发布及消费独立重试。先以后台任务运行，确需独立部署时再加 `cmd/worker`。 |
+| 异步投递 | `internal/outbox`、`internal/platform/rocketmq` | 在同一事务中保存消息和待投递事件，发布及消费独立重试。 |
 | 跨节点路由 | `internal/platform/redis`，连接路由策略仍在 `realtime` | 本地连接由网关管理，Redis 保存在线路由；消息历史仍以 MySQL 为准。 |
 | 群聊 | 继续放在 `internal/chat` | 复用会话和消息模型，新增群角色及成员权限，不复制一套收发链路。 |
 | 虚拟积分红包 | `internal/redpacket` | 独立管理扣款、领取、流水和退款事务；提交后通过事件发聊天通知，不在事务中直接调用 MQ。 |
-
-下一步：接入浏览器演示客户端，完成自动重连和增量补拉。

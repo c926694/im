@@ -18,6 +18,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/c926694/im/backend/internal/chat"
+	"github.com/c926694/im/backend/internal/friendship"
 	"github.com/c926694/im/backend/internal/platform/mysql"
 	"github.com/c926694/im/backend/internal/realtime"
 	"github.com/c926694/im/backend/internal/user"
@@ -62,7 +63,7 @@ func TestDirectChatMySQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	hub := realtime.NewHub()
-	server := testServer(t, NewRouter(user.NewStore(db), chat.NewStore(db), hub, testSecret), hub)
+	server := testServer(t, NewRouter(user.NewStore(db), chat.NewService(chat.NewStore(db)), friendship.NewService(friendship.NewStore(db)), hub, testSecret), hub)
 	alice := registerAndLogin(t, server, "alice", "")
 	bob := registerAndLogin(t, server, "bob", "?")
 	outsider := registerAndLogin(t, server, "outsider", "  "+strings.Repeat("你好!", 25)+"\n\t ")
@@ -76,6 +77,9 @@ func TestDirectChatMySQL(t *testing.T) {
 		ID string `json:"id"`
 	}
 	directPath := "/api/v1/conversations/direct"
+	request(t, server, http.MethodPost, directPath, alice.Token,
+		map[string]string{"peer_username": bob.Username}, http.StatusForbidden, nil)
+	befriend(t, server, alice, bob)
 	request(t, server, http.MethodPost, directPath, alice.Token,
 		map[string]string{"peer_username": " " + strings.ToUpper(bob.Username) + " "}, http.StatusOK, &conversation)
 	var reverse struct {
@@ -95,14 +99,8 @@ func TestDirectChatMySQL(t *testing.T) {
 	var summaries []conversationResponse
 	request(t, server, http.MethodGet, "/api/v1/conversations", bob.Token, nil, http.StatusOK, &summaries)
 	if len(summaries) != 1 || fmt.Sprint(summaries[0].ID) != conversation.ID ||
-		fmt.Sprint(summaries[0].PeerUserID) != alice.ID || summaries[0].PeerNickname != "alice" {
+		fmt.Sprint(summaries[0].PeerUserID) != alice.ID || summaries[0].PeerNickname != "alice" || !summaries[0].IsFriend {
 		t.Fatalf("unexpected conversations: %+v", summaries)
-	}
-	request(t, server, http.MethodPost, directPath, alice.Token,
-		map[string]string{"peer_username": outsider.Username}, http.StatusOK, nil)
-	request(t, server, http.MethodGet, "/api/v1/conversations", alice.Token, nil, http.StatusOK, &summaries)
-	if len(summaries) != 2 || summaries[0].PeerNickname != "outsider" || summaries[1].PeerNickname != "bob" {
-		t.Fatalf("unexpected peer nicknames: %+v", summaries)
 	}
 	path := "/api/v1/conversations/" + conversation.ID + "/messages"
 	request(t, server, http.MethodGet, path, outsider.Token, nil, http.StatusForbidden, nil)
@@ -147,11 +145,48 @@ func TestDirectChatMySQL(t *testing.T) {
 		t.Fatalf("unexpected history page: %+v", missed)
 	}
 	assertPush(t, events, send(t, server, path, alice.Token, 5))
+
+	request(t, server, http.MethodDelete, "/api/v1/friends/"+alice.ID, bob.Token, nil, http.StatusOK, nil)
+	request(t, server, http.MethodPost, directPath, alice.Token,
+		map[string]string{"peer_username": bob.Username}, http.StatusForbidden, nil)
+	for _, account := range []testAccount{alice, bob} {
+		request(t, server, http.MethodGet, "/api/v1/conversations", account.Token, nil, http.StatusOK, &summaries)
+		if len(summaries) != 1 || fmt.Sprint(summaries[0].ID) != conversation.ID || summaries[0].IsFriend {
+			t.Fatalf("history conversation should remain after removal: %+v", summaries)
+		}
+		request(t, server, http.MethodPost, path, account.Token, map[string]string{
+			"client_msg_id": "7a4ac694-2a74-4aa6-9611-503ffafc2b19", "content": "after removal",
+		}, http.StatusForbidden, nil)
+		request(t, server, http.MethodGet, path, account.Token, nil, http.StatusOK, &missed)
+		if len(missed) != 5 || missed[4] != first {
+			t.Fatalf("unexpected history after removal: %+v", missed)
+		}
+	}
+	request(t, server, http.MethodPost, path, alice.Token, firstDraft, http.StatusOK, &repeated)
+	if repeated != first {
+		t.Fatalf("retry after removal returned %+v, want %+v", repeated, first)
+	}
+	befriend(t, server, bob, alice)
+	request(t, server, http.MethodPost, directPath, bob.Token,
+		map[string]string{"peer_username": alice.Username}, http.StatusOK, &reverse)
+	if reverse.ID != conversation.ID {
+		t.Fatalf("refriended conversation = %s, want %s", reverse.ID, conversation.ID)
+	}
+	assertPush(t, events, send(t, server, path, alice.Token, 6))
+}
+
+func befriend(t *testing.T, server *httptest.Server, from, to testAccount) {
+	t.Helper()
+	var entry friendRequestResponse
+	request(t, server, http.MethodPost, "/api/v1/friend-requests", from.Token,
+		map[string]string{"peer_username": to.Username}, http.StatusOK, &entry)
+	request(t, server, http.MethodPatch, "/api/v1/friend-requests/"+entry.ID, to.Token,
+		map[string]string{"status": "accepted"}, http.StatusOK, nil)
 }
 
 func TestWebSocketTickets(t *testing.T) {
 	hub := realtime.NewHub()
-	server := testServer(t, NewRouter(nil, nil, hub, testSecret), hub)
+	server := testServer(t, NewRouter(nil, nil, nil, hub, testSecret), hub)
 	const ticketPath = "/api/v1/ws/tickets"
 	request(t, server, http.MethodPost, ticketPath, "", nil, http.StatusUnauthorized, nil)
 	request(t, server, http.MethodPost, ticketPath, signedToken(t, jwt.SigningMethodHS512, time.Now().Add(time.Hour)), nil, http.StatusUnauthorized, nil)

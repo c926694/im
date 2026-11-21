@@ -15,6 +15,7 @@ import (
 	"github.com/jmoiron/sqlx"
 
 	"github.com/c926694/im/backend/internal/chat"
+	"github.com/c926694/im/backend/internal/friendship"
 	"github.com/c926694/im/backend/internal/platform/mysql"
 )
 
@@ -34,9 +35,46 @@ func TestStoreMySQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	alice, bob, outsider := insertUser(t, ctx, db), insertUser(t, ctx, db), insertUser(t, ctx, db)
-	store := chat.NewStore(db)
+	store := chat.NewService(chat.NewStore(db))
+	friends := friendship.NewService(friendship.NewStore(db))
 	if _, err := store.CreateDirect(ctx, alice, 1<<62); !errors.Is(err, chat.ErrUserNotFound) {
 		t.Fatalf("open with unknown user error = %v", err)
+	}
+	var requests [8]friendship.Relationship
+	runConcurrently(t, len(requests), func(i int) error {
+		entry, err := friends.Request(ctx, alice, bob)
+		requests[i] = entry
+		return err
+	})
+	for _, entry := range requests {
+		if entry.RequestID == "" || entry.RequestID != requests[0].RequestID {
+			t.Fatalf("concurrent requests returned different IDs: %+v", requests)
+		}
+	}
+	var resolved [8]bool
+	runConcurrently(t, len(resolved), func(i int) error {
+		err := friends.Resolve(ctx, bob, requests[0].RequestID, friendship.Accepted)
+		if errors.Is(err, friendship.ErrRequestUnavailable) {
+			return nil
+		}
+		resolved[i] = err == nil
+		return err
+	})
+	decisions := 0
+	for _, ok := range resolved {
+		if ok {
+			decisions++
+		}
+	}
+	if decisions != 1 {
+		t.Fatalf("concurrent resolutions succeeded %d times, want 1", decisions)
+	}
+	entry, err := friends.Request(ctx, bob, outsider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := friends.Resolve(ctx, outsider, entry.RequestID, friendship.Accepted); err != nil {
+		t.Fatal(err)
 	}
 
 	var conversationIDs [8]int64

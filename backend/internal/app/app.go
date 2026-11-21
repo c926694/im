@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/c926694/im/backend/internal/chat"
+	"github.com/c926694/im/backend/internal/friendship"
 	"github.com/c926694/im/backend/internal/platform/mysql"
 	"github.com/c926694/im/backend/internal/realtime"
 	"github.com/c926694/im/backend/internal/transport/httpapi"
@@ -46,7 +47,7 @@ func Run(ctx context.Context) error {
 	defer hub.Close()
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           httpapi.NewRouter(user.NewStore(db), chat.NewStore(db), hub, []byte(secret)),
+		Handler:           httpapi.NewRouter(user.NewStore(db), chat.NewService(chat.NewStore(db)), friendship.NewService(friendship.NewStore(db)), hub, []byte(secret)),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	serveErr := make(chan error, 1)

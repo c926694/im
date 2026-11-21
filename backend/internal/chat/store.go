@@ -2,7 +2,6 @@ package chat
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"strings"
 	"time"
@@ -34,20 +33,13 @@ type ConversationSummary struct {
 	UnreadCount    int64
 }
 
-func (s *Store) CreateDirect(ctx context.Context, userID, peerID int64) (int64, error) {
-	if userID == peerID {
-		return 0, ErrSelfConversation
-	}
-	// 没有物理外键，建聊前要确认双方账号都存在。
+func (s *Store) countUsers(ctx context.Context, userID, peerID int64) (int, error) {
 	var users int
-	if err := s.db.GetContext(ctx, &users, `SELECT COUNT(*) FROM users WHERE id IN (?, ?)`, userID, peerID); err != nil {
-		return 0, err
-	}
-	if users != 2 {
-		return 0, ErrUserNotFound
-	}
-	// 固定用户 ID 的顺序，避免双方各建出一个单聊。
-	low, high := min(userID, peerID), max(userID, peerID)
+	err := s.db.GetContext(ctx, &users, `SELECT COUNT(*) FROM users WHERE id IN (?, ?)`, userID, peerID)
+	return users, err
+}
+
+func (s *Store) upsertDirect(ctx context.Context, low, high int64) (int64, error) {
 	tx, err := s.db.BeginTxx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -154,29 +146,20 @@ func (s *Store) fillUnreadCounts(ctx context.Context, userID int64, conversation
 	return nil
 }
 
-func (s *Store) requireMember(ctx context.Context, userID, conversationID int64) error {
-	var member int
+func (s *Store) isMember(ctx context.Context, userID, conversationID int64) (bool, error) {
+	var member bool
 	err := s.db.GetContext(ctx, &member, `
-		SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ?`, conversationID, userID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ErrNotMember
-	}
-	return err
+		SELECT EXISTS (SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ?)`, conversationID, userID)
+	return member, err
 }
 
-func (s *Store) MarkRead(ctx context.Context, userID, conversationID, seq int64) error {
-	// 先确认是会话成员，再读取会话的最新序号，防止把游标标到尚未发送的消息。
-	if err := s.requireMember(ctx, userID, conversationID); err != nil {
-		return err
-	}
+func (s *Store) lastSequence(ctx context.Context, conversationID int64) (int64, error) {
 	var lastSeq int64
-	if err := s.db.GetContext(ctx, &lastSeq, `SELECT last_seq FROM conversations WHERE id = ?`, conversationID); err != nil {
-		return err
-	}
-	if seq < 0 || seq > lastSeq {
-		return ErrInvalidReadSeq
-	}
-	// 旧设备上报的游标不能覆盖更新的已读进度。
+	err := s.db.GetContext(ctx, &lastSeq, `SELECT last_seq FROM conversations WHERE id = ?`, conversationID)
+	return lastSeq, err
+}
+
+func (s *Store) advanceRead(ctx context.Context, userID, conversationID, seq int64) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE conversation_members
 		SET last_read_seq = GREATEST(last_read_seq, ?)

@@ -32,26 +32,38 @@ func (s *Store) FindIDByUsername(ctx context.Context, username string) (int64, e
 	return id, err
 }
 
-func (s *Store) NicknamesByIDs(ctx context.Context, ids []int64) (map[int64]string, error) {
-	nicknames := make(map[int64]string, len(ids))
-	if len(ids) == 0 {
-		return nicknames, nil
+type Profile struct {
+	ID       int64  `db:"id" json:"id,string"`
+	Username string `db:"username" json:"username"`
+	Nickname string `db:"nickname" json:"nickname"`
+}
+
+func (s *Store) FindProfileByUsername(ctx context.Context, username string) (Profile, error) {
+	var profile Profile
+	err := s.db.GetContext(ctx, &profile, `SELECT id, username, nickname FROM users WHERE username = ?`, username)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Profile{}, ErrUserNotFound
 	}
-	query, args, err := sqlx.In(`SELECT id, nickname FROM users WHERE id IN (?)`, ids)
+	return profile, err
+}
+
+func (s *Store) ProfilesByIDs(ctx context.Context, ids []int64) (map[int64]Profile, error) {
+	byID := make(map[int64]Profile, len(ids))
+	if len(ids) == 0 {
+		return byID, nil
+	}
+	query, args, err := sqlx.In(`SELECT id, username, nickname FROM users WHERE id IN (?)`, ids)
 	if err != nil {
 		return nil, err
 	}
-	var profiles []struct {
-		ID       int64  `db:"id"`
-		Nickname string `db:"nickname"`
-	}
+	var profiles []Profile
 	if err := s.db.SelectContext(ctx, &profiles, query, args...); err != nil {
 		return nil, err
 	}
 	for _, profile := range profiles {
-		nicknames[profile.ID] = profile.Nickname
+		byID[profile.ID] = profile
 	}
-	return nicknames, nil
+	return byID, nil
 }
 
 func (s *Store) Register(ctx context.Context, username, password, nickname string) (int64, error) {

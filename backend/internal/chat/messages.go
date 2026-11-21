@@ -2,12 +2,13 @@ package chat
 
 import (
 	"context"
-	"database/sql"
 	"encoding/hex"
 	"errors"
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/jmoiron/sqlx"
 )
 
 var (
@@ -53,103 +54,61 @@ type SendResult struct {
 	Created     bool
 }
 
-func (s *Store) SendMessage(ctx context.Context, userID, conversationID int64, draft MessageDraft) (SendResult, error) {
-	// 先确认当前用户是会话成员，防止非成员向别人的会话发消息。
-	if err := s.requireMember(ctx, userID, conversationID); err != nil {
-		return SendResult{}, err
-	}
-	tx, err := s.db.BeginTxx(ctx, nil)
-	if err != nil {
-		return SendResult{}, err
-	}
-	defer tx.Rollback()
-
-	// 锁住会话行，让同一会话的并发发送依次分配序号。
-	var conversation struct {
-		LastSeq int64 `db:"last_seq"`
-		LowID   int64 `db:"direct_user_low_id"`
-		HighID  int64 `db:"direct_user_high_id"`
-	}
-	if err := tx.GetContext(ctx, &conversation, `
-		SELECT last_seq, direct_user_low_id, direct_user_high_id FROM conversations WHERE id = ? FOR UPDATE`, conversationID); err != nil {
-		return SendResult{}, err
-	}
-	recipientID := conversation.LowID
-	if userID == conversation.LowID {
-		recipientID = conversation.HighID
-	}
-
-	// 分配序号前先查重，重试返回原消息，不占用新的序号。
-	var message Message
-	err = tx.GetContext(ctx, &message, selectMessage+`
-		WHERE conversation_id = ? AND sender_id = ? AND client_msg_id = ?`, conversationID, userID, draft.clientMsgID)
-	if err == nil {
-		return SendResult{Message: message, RecipientID: recipientID}, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return SendResult{}, err
-	}
-
-	message = Message{
-		ConversationID: conversationID, SenderID: userID, ClientMsgID: draft.clientMsgID,
-		Seq: conversation.LastSeq + 1, Content: draft.content, CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
-	}
-	result, err := tx.ExecContext(ctx, `
-		INSERT INTO messages (conversation_id, sender_id, client_msg_id, seq, content, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)`, conversationID, userID, draft.clientMsgID, message.Seq, draft.content, message.CreatedAt)
-	if err != nil {
-		return SendResult{}, err
-	}
-	message.ID, err = result.LastInsertId()
-	if err != nil {
-		return SendResult{}, err
-	}
-	// 消息和会话游标在同一事务里更新，提交成功后才确认发送。
-	_, err = tx.ExecContext(ctx, `
-		UPDATE conversations SET last_seq = ?, last_activity_at = ? WHERE id = ?`,
-		message.Seq, message.CreatedAt, conversationID)
-	if err != nil {
-		return SendResult{}, err
-	}
-	if err = tx.Commit(); err != nil {
-		return SendResult{}, err
-	}
-	return SendResult{Message: message, RecipientID: recipientID, Created: true}, nil
+type directConversation struct {
+	LastSeq int64 `db:"last_seq"`
+	LowID   int64 `db:"direct_user_low_id"`
+	HighID  int64 `db:"direct_user_high_id"`
 }
 
-// History 在 beforeSeq 为 0 时从最新消息开始查。
-func (s *Store) History(ctx context.Context, userID, conversationID, beforeSeq int64, limit int) ([]Message, error) {
+func (s *Store) lockDirectConversation(ctx context.Context, tx *sqlx.Tx, id int64) (directConversation, error) {
+	var conversation directConversation
+	err := tx.GetContext(ctx, &conversation, `
+		SELECT last_seq, direct_user_low_id, direct_user_high_id FROM conversations WHERE id = ? FOR UPDATE`, id)
+	return conversation, err
+}
+
+func (s *Store) findSentMessage(ctx context.Context, tx *sqlx.Tx, conversationID, userID int64, clientMsgID string) (Message, error) {
+	var message Message
+	err := tx.GetContext(ctx, &message, selectMessage+`
+		WHERE conversation_id = ? AND sender_id = ? AND client_msg_id = ?`, conversationID, userID, clientMsgID)
+	return message, err
+}
+
+func (s *Store) insertMessage(ctx context.Context, tx *sqlx.Tx, message Message) (int64, error) {
+	result, err := tx.ExecContext(ctx, `
+		INSERT INTO messages (conversation_id, sender_id, client_msg_id, seq, content, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)`, message.ConversationID, message.SenderID, message.ClientMsgID, message.Seq, message.Content, message.CreatedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
+func (s *Store) updateLastMessage(ctx context.Context, tx *sqlx.Tx, message Message) error {
+	_, err := tx.ExecContext(ctx, `UPDATE conversations SET last_seq = ?, last_activity_at = ? WHERE id = ?`,
+		message.Seq, message.CreatedAt, message.ConversationID)
+	return err
+}
+
+func (s *Store) history(ctx context.Context, conversationID, beforeSeq int64, limit int) ([]Message, error) {
 	query := selectMessage + ` WHERE conversation_id = ?`
 	args := []any{conversationID}
 	if beforeSeq != 0 {
 		query += ` AND seq < ?`
 		args = append(args, beforeSeq)
 	}
-	// 复用成员鉴权和分页逻辑；聊天记录从新到旧查。
-	return s.listMessages(ctx, userID, conversationID, limit, query+` ORDER BY seq DESC LIMIT ?`, args)
+	return s.queryMessages(ctx, query+` ORDER BY seq DESC LIMIT ?`, append(args, limit)...)
 }
 
-func (s *Store) Sync(ctx context.Context, userID, conversationID, afterSeq int64, limit int) ([]Message, error) {
-	// 从设备自己的同步游标向后补拉，按序号升序返回，不使用账号的已读游标。
-	return s.listMessages(ctx, userID, conversationID, limit,
+func (s *Store) sync(ctx context.Context, conversationID, afterSeq int64, limit int) ([]Message, error) {
+	return s.queryMessages(ctx,
 		selectMessage+` WHERE conversation_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?`,
-		[]any{conversationID, afterSeq})
+		conversationID, afterSeq, limit)
 }
 
-func (s *Store) listMessages(ctx context.Context, userID, conversationID int64, limit int, query string, args []any) ([]Message, error) {
-	if limit == 0 {
-		limit = 50
-	}
-	if limit < 1 || limit > 100 {
-		return nil, ErrInvalidPageSize
-	}
-	// 历史查询和断线补拉统一在这里校验成员权限，再查消息。
-	if err := s.requireMember(ctx, userID, conversationID); err != nil {
-		return nil, err
-	}
-
+func (s *Store) queryMessages(ctx context.Context, query string, args ...any) ([]Message, error) {
 	messages := []Message{}
-	if err := s.db.SelectContext(ctx, &messages, query, append(args, limit)...); err != nil {
+	if err := s.db.SelectContext(ctx, &messages, query, args...); err != nil {
 		return nil, err
 	}
 	return messages, nil

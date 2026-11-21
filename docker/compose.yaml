@@ -50,6 +50,7 @@ services:
       - mysql-data:/var/lib/mysql
       - ../backend/migrations/000001_direct_chat.up.sql:/docker-entrypoint-initdb.d/000001_direct_chat.sql:ro
       - ../backend/migrations/000002_direct_chat_comments.up.sql:/docker-entrypoint-initdb.d/000002_direct_chat_comments.sql:ro
+      - ../backend/migrations/000003_friendships.up.sql:/docker-entrypoint-initdb.d/000003_friendships.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "MYSQL_PWD=\"$$MYSQL_PASSWORD\" mysql --protocol=TCP -h 127.0.0.1 -u \"$$MYSQL_USER\" \"$$MYSQL_DATABASE\" -e \"SELECT 1 FROM messages LIMIT 1\""]
       interval: 5s

@@ -90,8 +90,8 @@ label { display: block; font-weight: 600; }
 .connection::before { width: 7px; height: 7px; background: #e8b977; border-radius: 50%; content: ""; }
 .connection[data-status="online"]::before { background: #98d9b7; }
 .connection[data-status="offline"]::before { background: #f4a1ac; }
-.direct-form { display: grid; gap: 6px; padding: 0 20px 18px; }
-.direct-form label { font-size: .875rem; }
+.sidebar-nav { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 20px 14px; }
+.sidebar-nav button[aria-pressed="true"] { color: white; background: var(--nav-panel); }
 .direct-fields, .composer-fields { display: flex; align-items: stretch; gap: 8px; }
 .direct-fields button, .composer-fields button { flex: none; }
 .sidebar button { border-color: #655977; }
@@ -106,6 +106,15 @@ label { display: block; font-weight: 600; }
 .conversation-label { display: grid; gap: 2px; min-width: 0; overflow-wrap: anywhere; }
 .conversation-label strong { color: white; }
 .conversation-label time { font-size: .8125rem; }
+.friends-heading, .friend-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.friends-heading { padding: 0 8px 10px; }
+.friends-heading h2 { padding: 0; margin: 0; }
+.friend-lookup { display: grid; gap: 6px; padding: 0 8px 12px; }
+.friend-row { flex-wrap: wrap; padding: 10px 8px; border-top: 1px solid #50445f; }
+.friend-row .conversation-label { flex: 1 1 88px; }
+.friend-result { margin-bottom: 12px; background: var(--nav-panel); }
+.friend-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.friends h3 { margin: 14px 8px 8px; color: white; font-size: .875rem; }
 .avatar { display: grid; place-items: center; flex: none; width: 40px; height: 40px; border-radius: 50%; background: var(--lilac); color: var(--accent); font-size: .875rem; font-weight: 700; }
 .account { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; padding: 12px 20px; border-top: 1px solid #50445f; }
 .account > span { display: grid; min-width: 0; overflow-wrap: anywhere; font-size: .8125rem; }
