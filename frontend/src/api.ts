@@ -5,26 +5,69 @@ export type Session = {
   expiresAt: number;
 };
 
-export type Conversation = {
+type ConversationBase = {
   id: string;
-  is_friend: boolean;
-  peer_nickname: string;
+  joined_seq: string;
   last_seq: string;
   last_read_seq: string;
+  last_message: string;
   unread_count: number;
   last_activity_at: string;
 };
 
+export type Conversation = ConversationBase & (
+  { kind: "direct"; peer_nickname: string; is_friend: boolean } |
+  { kind: "group"; group_name: string }
+);
+
+export function conversationTitle(conversation: Conversation) {
+  return conversation.kind === "group" ? conversation.group_name : conversation.peer_nickname;
+}
+
 export type Profile = { id: string; username: string; nickname: string };
 export type FriendRequest = { id: string; peer: Profile; direction: "incoming" | "outgoing" };
+export type GroupRole = "owner" | "admin" | "member";
+export type GroupMember = Profile & { role: GroupRole };
+export type Group = { id: string; name: string; members: GroupMember[] };
 
 export type Message = {
+  kind: "text" | "red_packet" | "red_packet_claim";
+  red_packet_id?: string;
+  red_packet_status?: RedPacketStatus;
   id: string;
   conversation_id: string;
   sender_id: string;
+  sender_nickname: string;
   client_msg_id: string;
   seq: string;
   content: string;
+  created_at: string;
+};
+
+export type PacketDraft = {
+  client_msg_id: string;
+  points_per_share: string;
+  share_count: number;
+};
+export type PacketClaim = { points: string; created_at: string };
+export type RedPacketStatus = "open" | "claimed" | "expired" | "refunded";
+export type RedPacket = {
+  id: string;
+  sender_id: string;
+  points_per_share: string;
+  share_count: number;
+  remaining: number;
+  status: RedPacketStatus;
+  expires_at: string;
+  can_claim: boolean;
+  my_claim: PacketClaim | null;
+};
+export type PointEntry = {
+  id: string;
+  kind: "grant" | "send" | "claim" | "refund";
+  ref_id: string;
+  delta: string;
+  balance_after: string;
   created_at: string;
 };
 
@@ -40,6 +83,7 @@ type APIResponse<T> = {
 export const errorCode = {
   invalidToken: 40003,
   notFriends: 40006,
+  notMember: 40007,
 } as const;
 
 export class APIError extends Error {
@@ -117,6 +161,24 @@ export function chatAPI(session: Session, onExpired: () => void) {
       method: "POST",
       body: JSON.stringify({ peer_username: peerUsername }),
     }),
+    createGroup: (name: string, memberIDs: string[]) => authorized<{ id: string }>("/groups", {
+      method: "POST", body: JSON.stringify({ name, member_ids: memberIDs }),
+    }),
+    groupDetails: (id: string, signal: AbortSignal) => authorized<Group>(`/groups/${id}`, { signal }),
+    renameGroup: (id: string, name: string) => authorized<{ id: string }>(`/groups/${id}`, {
+      method: "PATCH", body: JSON.stringify({ name }),
+    }),
+    inviteGroupMembers: (id: string, memberIDs: string[]) => authorized<{ id: string }>(`/groups/${id}/members`, {
+      method: "POST", body: JSON.stringify({ member_ids: memberIDs }),
+    }),
+    removeGroupMember: (id: string, userID: string) => authorized<{ id: string }>(`/groups/${id}/members/${userID}`, { method: "DELETE" }),
+    setGroupRole: (id: string, userID: string, role: "admin" | "member") => authorized<{ id: string }>(`/groups/${id}/members/${userID}`, {
+      method: "PATCH", body: JSON.stringify({ role }),
+    }),
+    transferGroup: (id: string, userID: string) => authorized<{ id: string }>(`/groups/${id}/transfer`, {
+      method: "POST", body: JSON.stringify({ user_id: userID }),
+    }),
+    leaveGroup: (id: string) => authorized<{ id: string }>(`/groups/${id}/leave`, { method: "POST" }),
     ticket: (signal: AbortSignal) => authorized<{ ticket: string }>("/ws/tickets", { method: "POST", signal }),
     messages: (id: string, cursor: { before_seq: string } | { after_seq: string } | null, signal?: AbortSignal) => {
       const params = new URLSearchParams({ limit: String(pageSize), ...cursor });
@@ -126,6 +188,16 @@ export function chatAPI(session: Session, onExpired: () => void) {
       method: "POST",
       body: JSON.stringify(draft),
     }),
+    pointBalance: (signal?: AbortSignal) => authorized<{ balance: string }>("/points/balance", { signal }),
+    pointLedger: (beforeID?: string, signal?: AbortSignal) => {
+      const query = beforeID ? `?before_id=${beforeID}` : "";
+      return authorized<PointEntry[]>(`/points/ledger${query}`, { signal });
+    },
+    sendPacket: (id: string, draft: PacketDraft) => authorized<{ red_packet_id: string; message: Message }>(`/conversations/${id}/red-packets`, {
+      method: "POST", body: JSON.stringify(draft),
+    }),
+    packetDetails: (id: string, signal?: AbortSignal) => authorized<RedPacket>(`/red-packets/${id}`, { signal }),
+    claimPacket: (id: string) => authorized<PacketClaim>(`/red-packets/${id}/claim`, { method: "POST" }),
     markRead: (id: string, seq: string, signal?: AbortSignal) => authorized<null>(`/conversations/${id}/read`, {
       method: "POST",
       body: JSON.stringify({ seq }),

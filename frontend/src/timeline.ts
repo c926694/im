@@ -1,5 +1,5 @@
 import { pageSize } from "./api";
-import type { Message } from "./api";
+import type { Conversation, Message } from "./api";
 
 export type Timeline = {
   messages: Message[];
@@ -12,25 +12,38 @@ export const emptyTimeline: Timeline = {
   messages: [], oldestSeq: null, cursor: 0n, hasOlder: false,
 };
 
-export type TimelineAction = {
-  id: string;
+export function timelineKey(conversation: Conversation) {
+  return `${conversation.id}:${conversation.joined_seq}`;
+}
+
+export type TimelineAction = { source: "keep"; keys: string[] } | {
+  key: string;
+  joinedSeq: bigint;
   source: "history" | "sync" | "live";
   messages: Message[];
 };
 
 export function timelinesReducer(timelines: Record<string, Timeline>, action: TimelineAction) {
-  const timeline = timelines[action.id] ?? emptyTimeline;
+  if (action.source === "keep") {
+    const keys = new Set(action.keys);
+    return Object.fromEntries(Object.entries(timelines).filter(([key]) => keys.has(key)));
+  }
+  const { key, joinedSeq } = action;
+  const timeline = timelines[key] ?? emptyTimeline;
   const byID = new Map(timeline.messages.map((message) => [message.id, message]));
-  for (const message of action.messages) byID.set(message.id, message);
+  for (const message of action.messages) {
+    if (BigInt(message.seq) > joinedSeq) byID.set(message.id, message);
+  }
   const messages = [...byID.values()].sort((a, b) => BigInt(a.seq) < BigInt(b.seq) ? -1 : 1);
 
   let { oldestSeq, cursor, hasOlder } = timeline;
   if (action.source === "history") {
     const oldest = action.messages.at(-1)?.seq;
     // 首次打开会话时，以最近一页的起点为准，更早的消息由历史查询加载。
-    if (oldestSeq === null) cursor = BigInt(oldest ?? "1") - 1n;
-    oldestSeq = oldest ?? oldestSeq ?? "1";
-    hasOlder = action.messages.length === pageSize && oldestSeq !== "1";
+    const firstAllowed = joinedSeq + 1n;
+    if (oldestSeq === null) cursor = oldest ? BigInt(oldest) - 1n : joinedSeq;
+    oldestSeq = oldest ?? oldestSeq ?? firstAllowed.toString();
+    hasOlder = action.messages.length === pageSize && BigInt(oldestSeq) > firstAllowed;
   }
   if (oldestSeq !== null) {
     // 已读进度与本页的同步进度独立，WebSocket 序号出现缺口时保留原进度。
@@ -41,5 +54,5 @@ export function timelinesReducer(timelines: Record<string, Timeline>, action: Ti
       cursor = seq;
     }
   }
-  return { ...timelines, [action.id]: { messages, oldestSeq, cursor, hasOlder } };
+  return { ...timelines, [key]: { messages, oldestSeq, cursor, hasOlder } };
 }

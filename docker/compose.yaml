@@ -25,12 +25,15 @@ services:
       GIN_MODE: release
       IM_HTTP_ADDR: 0.0.0.0:8080
       IM_JWT_SECRET: ${IM_JWT_SECRET:?Set IM_JWT_SECRET in docker/.env}
+      IM_ROCKETMQ_NAMESRV: rocketmq-namesrv:9876
       IM_MYSQL_DSN: ${IM_MYSQL_USER:-im_dev}:${IM_MYSQL_PASSWORD:?Set IM_MYSQL_PASSWORD in docker/.env}@tcp(mysql:3306)/${IM_MYSQL_DATABASE:-im}
     ports:
       - "127.0.0.1:${IM_BACKEND_PORT:-8080}:8080"
     depends_on:
       mysql:
         condition: service_healthy
+      rocketmq-topic:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
       interval: 5s
@@ -48,11 +51,8 @@ services:
       - "127.0.0.1:${IM_MYSQL_PORT:-3306}:3306"
     volumes:
       - mysql-data:/var/lib/mysql
-      - ../backend/migrations/000001_direct_chat.up.sql:/docker-entrypoint-initdb.d/000001_direct_chat.sql:ro
-      - ../backend/migrations/000002_direct_chat_comments.up.sql:/docker-entrypoint-initdb.d/000002_direct_chat_comments.sql:ro
-      - ../backend/migrations/000003_friendships.up.sql:/docker-entrypoint-initdb.d/000003_friendships.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "MYSQL_PWD=\"$$MYSQL_PASSWORD\" mysql --protocol=TCP -h 127.0.0.1 -u \"$$MYSQL_USER\" \"$$MYSQL_DATABASE\" -e \"SELECT 1 FROM messages LIMIT 1\""]
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$$MYSQL_PASSWORD\" mysql --protocol=TCP -h 127.0.0.1 -u \"$$MYSQL_USER\" \"$$MYSQL_DATABASE\" -e \"SELECT 1\""]
       interval: 5s
       timeout: 4s
       retries: 15
@@ -62,6 +62,8 @@ services:
     image: redis:7.4-alpine
     ports:
       - "127.0.0.1:${IM_REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -80,11 +82,15 @@ services:
       retries: 12
 
   rocketmq-broker:
-    image: apache/rocketmq:5.3.4
+    image: im-rocketmq-broker:5.3.4
+    build:
+      context: ..
+      dockerfile: docker/rocketmq-broker.Dockerfile
     command: ["broker", "-n", "rocketmq-namesrv:9876", "-c", "/etc/rocketmq/broker.conf"]
     environment:
       JAVA_OPT_EXT: -Xms512m -Xmx512m -Xmn256m -XX:MaxDirectMemorySize=512m
     volumes:
+      - rocketmq-data:/home/rocketmq/store
       - ./rocketmq-broker.conf:/etc/rocketmq/broker.conf:ro
     depends_on:
       rocketmq-namesrv:
@@ -96,5 +102,15 @@ services:
       retries: 8
       start_period: 15s
 
+  rocketmq-topic:
+    image: apache/rocketmq:5.3.4
+    entrypoint: ["sh", "mqadmin"]
+    command: ["updateTopic", "-n", "rocketmq-namesrv:9876", "-c", "im-local", "-t", "im_redpacket_events"]
+    depends_on:
+      rocketmq-broker:
+        condition: service_healthy
+
 volumes:
+  rocketmq-data:
   mysql-data:
+  redis-data:

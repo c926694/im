@@ -1,12 +1,19 @@
 import { useEffect, useEffectEvent, useState } from "react";
-import type { ChatAPI, Message } from "./api";
+import type { ChatAPI, Message, RedPacketStatus } from "./api";
 
 export const statusLabels = { connecting: "正在连接", online: "已连接", offline: "连接已断开" };
 
-export function useRealtime(api: ChatAPI, onMessage: (message: Message) => void) {
+type Frame = { type: "message.created"; data: Message } |
+  { type: "conversation.updated"; data: { conversation_id: string } } |
+  { type: "red_packet.updated"; data: { red_packet_id: string; status: RedPacketStatus } };
+
+export function useRealtime(api: ChatAPI, onMessage: (message: Message) => void, onConversationUpdated: (id: string) => void,
+  onPacketUpdated: (id: string, status: RedPacketStatus) => void) {
   const [status, setStatus] = useState<"connecting" | "online" | "offline">("connecting");
   const [epoch, setEpoch] = useState(0);
   const receive = useEffectEvent(onMessage);
+  const refresh = useEffectEvent(onConversationUpdated);
+  const refreshPacket = useEffectEvent(onPacketUpdated);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -43,8 +50,10 @@ export function useRealtime(api: ChatAPI, onMessage: (message: Message) => void)
           setEpoch((value) => value + 1);
         };
         socket.onmessage = (event: MessageEvent<string>) => {
-          const frame = JSON.parse(event.data) as { type: string; data: Message };
+          const frame = JSON.parse(event.data) as Frame;
           if (frame.type === "message.created") receive(frame.data);
+          if (frame.type === "red_packet.updated") refreshPacket(frame.data.red_packet_id, frame.data.status);
+          if (frame.type === "conversation.updated") refresh(frame.data.conversation_id);
         };
         socket.onclose = () => {
           socket = undefined;

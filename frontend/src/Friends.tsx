@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import type { ChatAPI, FriendRequest, Profile } from "./api";
+import { Avatar } from "./visuals";
 
 export function Friends({ api, userID, view, onOpen, onChanged }: {
   api: ChatAPI;
@@ -133,5 +134,7 @@ export function Friends({ api, userID, view, onOpen, onChanged }: {
 }
 
 function FriendName({ profile }: { profile: Profile }) {
-  return <span className="conversation-label"><strong>{profile.nickname}</strong><span>@{profile.username}</span></span>;
+  return <span className="friend-identity"><Avatar name={profile.nickname} />
+    <span className="conversation-label"><strong>{profile.nickname}</strong><span>@{profile.username}</span></span>
+  </span>;
 }

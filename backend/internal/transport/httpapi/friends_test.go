@@ -25,7 +25,7 @@ func TestFriendRequestsMySQL(t *testing.T) {
 	}
 	t.Cleanup(func() { db.Close() })
 	hub := realtime.NewHub()
-	server := testServer(t, NewRouter(user.NewStore(db), chat.NewService(chat.NewStore(db)), friendship.NewService(friendship.NewStore(db)), hub, testSecret), hub)
+	server := testServer(t, NewRouter(user.NewStore(db), chat.NewService(chat.NewStore(db)), friendship.NewService(friendship.NewStore(db)), hub, testSecret, nil, nil), hub)
 	alice := registerAndLogin(t, server, "alice", "alice-password")
 	bob := registerAndLogin(t, server, "bob", "bob-password")
 	out := registerAndLogin(t, server, "outsider", "other-password")

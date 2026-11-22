@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 
@@ -55,11 +56,27 @@ var testSecret = []byte("test-only-jwt-key-with-at-least-32-bytes")
 
 func TestHealthResponse(t *testing.T) {
 	hub := realtime.NewHub()
-	server := testServer(t, NewRouter(nil, nil, nil, hub, testSecret), hub)
+	server := testServer(t, NewRouter(nil, nil, nil, hub, testSecret, nil, nil), hub)
 	var health apiResponse
 	request(t, server, http.MethodGet, "/healthz", "", nil, http.StatusOK, &health)
 	if health.Code != codeSuccess || health.Msg != "success" || string(health.Data) != `{"status":"ok"}` {
 		t.Fatalf("health response = %+v", health)
+	}
+}
+
+func TestCanceledRequestDoesNotWriteErrorResponse(t *testing.T) {
+	router := gin.New()
+	router.GET("/cancel", func(c *gin.Context) {
+		internalError(c, context.Canceled)
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	request := httptest.NewRequest(http.MethodGet, "/cancel", nil).WithContext(ctx)
+	recorder := httptest.NewRecorder()
+
+	router.ServeHTTP(recorder, request)
+	if recorder.Body.Len() != 0 {
+		t.Fatalf("canceled request wrote a response: %s", recorder.Body.String())
 	}
 }
 
@@ -79,7 +96,7 @@ func TestDirectChatMySQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	hub := realtime.NewHub()
-	server := testServer(t, NewRouter(user.NewStore(db), chat.NewService(chat.NewStore(db)), friendship.NewService(friendship.NewStore(db)), hub, testSecret), hub)
+	server := testServer(t, NewRouter(user.NewStore(db), chat.NewService(chat.NewStore(db)), friendship.NewService(friendship.NewStore(db)), hub, testSecret, nil, nil), hub)
 	alice := registerAndLogin(t, server, "alice", "")
 	bob := registerAndLogin(t, server, "bob", "?")
 	outsider := registerAndLogin(t, server, "outsider", "  "+strings.Repeat("你好!", 25)+"\n\t ")
@@ -115,7 +132,8 @@ func TestDirectChatMySQL(t *testing.T) {
 	var summaries []conversationResponse
 	request(t, server, http.MethodGet, "/api/v1/conversations", bob.Token, nil, http.StatusOK, &summaries)
 	if len(summaries) != 1 || fmt.Sprint(summaries[0].ID) != conversation.ID ||
-		fmt.Sprint(summaries[0].PeerUserID) != alice.ID || summaries[0].PeerNickname != "alice" || !summaries[0].IsFriend {
+		fmt.Sprint(summaries[0].PeerUserID) != alice.ID || summaries[0].PeerNickname != "alice" ||
+		!summaries[0].IsFriend || summaries[0].LastMessage != "" {
 		t.Fatalf("unexpected conversations: %+v", summaries)
 	}
 	path := "/api/v1/conversations/" + conversation.ID + "/messages"
@@ -160,7 +178,12 @@ func TestDirectChatMySQL(t *testing.T) {
 	if len(missed) != 2 || missed[0] != third || missed[1] != second {
 		t.Fatalf("unexpected history page: %+v", missed)
 	}
-	assertPush(t, events, send(t, server, path, alice.Token, 5))
+	fifth := send(t, server, path, alice.Token, 5)
+	assertPush(t, events, fifth)
+	request(t, server, http.MethodGet, "/api/v1/conversations", bob.Token, nil, http.StatusOK, &summaries)
+	if len(summaries) != 1 || summaries[0].LastSeq != fifth.Seq || summaries[0].LastMessage != fifth.Content {
+		t.Fatalf("unexpected latest message in summaries: %+v", summaries)
+	}
 	assertReadProgress(t, server, alice.Token, 0, 0)
 	assertReadProgress(t, server, bob.Token, 0, 5)
 	readPath := "/api/v1/conversations/" + conversation.ID + "/read"
@@ -238,7 +261,7 @@ func befriend(t *testing.T, server *httptest.Server, from, to testAccount) {
 
 func TestWebSocketTickets(t *testing.T) {
 	hub := realtime.NewHub()
-	server := testServer(t, NewRouter(nil, nil, nil, hub, testSecret), hub)
+	server := testServer(t, NewRouter(nil, nil, nil, hub, testSecret, nil, nil), hub)
 	const ticketPath = "/api/v1/ws/tickets"
 	request(t, server, http.MethodPost, ticketPath, "", nil, http.StatusUnauthorized, nil)
 	request(t, server, http.MethodPost, ticketPath, signedToken(t, jwt.SigningMethodHS512, time.Now().Add(time.Hour)), nil, http.StatusUnauthorized, nil)

@@ -12,19 +12,28 @@ import (
 	"github.com/c926694/im/backend/internal/chat"
 	"github.com/c926694/im/backend/internal/friendship"
 	"github.com/c926694/im/backend/internal/realtime"
+	"github.com/c926694/im/backend/internal/redpacket"
 	"github.com/c926694/im/backend/internal/user"
 )
 
 type messageResponse realtime.MessageCreated
 
+func newMessageResponse(message chat.Message, nickname string) messageResponse {
+	return messageResponse(realtime.NewMessageCreated(message, nickname))
+}
+
 type conversationResponse struct {
 	ID             int64     `json:"id,string"`
-	PeerUserID     int64     `json:"peer_user_id,string"`
-	PeerNickname   string    `json:"peer_nickname"`
+	Kind           chat.Kind `json:"kind"`
+	GroupName      string    `json:"group_name,omitempty"`
+	JoinedSeq      int64     `json:"joined_seq,string"`
+	PeerUserID     int64     `json:"peer_user_id,string,omitempty"`
+	PeerNickname   string    `json:"peer_nickname,omitempty"`
 	IsFriend       bool      `json:"is_friend"`
 	LastSeq        int64     `json:"last_seq,string"`
 	LastReadSeq    int64     `json:"last_read_seq,string"`
 	LastActivityAt time.Time `json:"last_activity_at"`
+	LastMessage    string    `json:"last_message"`
 	UnreadCount    int64     `json:"unread_count"`
 }
 
@@ -68,7 +77,9 @@ func (h *handler) listConversations(c *gin.Context) {
 	}
 	peerIDs := make([]int64, 0, len(conversations))
 	for _, conversation := range conversations {
-		peerIDs = append(peerIDs, conversation.PeerUserID)
+		if conversation.Kind == chat.Direct {
+			peerIDs = append(peerIDs, conversation.PeerUserID)
+		}
 	}
 	// 一次查询当前列表的昵称，避免逐个查询用户。
 	profiles, err := h.users.ProfilesByIDs(ctx, peerIDs)
@@ -77,7 +88,7 @@ func (h *handler) listConversations(c *gin.Context) {
 		return
 	}
 	accepted := make(map[int64]bool)
-	if len(conversations) > 0 {
+	if len(peerIDs) > 0 {
 		// 好友状态只控制发送入口，历史会话仍保留在列表中。
 		friends, err := h.friends.List(ctx, userID, friendship.Accepted)
 		if err != nil {
@@ -92,9 +103,11 @@ func (h *handler) listConversations(c *gin.Context) {
 	for i, conversation := range conversations {
 		response[i] = conversationResponse{
 			ID: conversation.ID, PeerUserID: conversation.PeerUserID, PeerNickname: profiles[conversation.PeerUserID].Nickname,
+			Kind: conversation.Kind, GroupName: conversation.GroupName, JoinedSeq: conversation.JoinedSeq,
 			IsFriend: accepted[conversation.PeerUserID],
 			LastSeq:  conversation.LastSeq, LastReadSeq: conversation.LastReadSeq,
-			LastActivityAt: conversation.LastActivityAt, UnreadCount: conversation.UnreadCount,
+			LastActivityAt: conversation.LastActivityAt, LastMessage: conversation.LastMessage,
+			UnreadCount: conversation.UnreadCount,
 		}
 	}
 	respondSuccess(c, response)
@@ -119,19 +132,27 @@ func (h *handler) sendMessage(c *gin.Context) {
 		return
 	}
 
-	// 发送者取自 Bearer 身份；发送服务校验会话成员与好友资格。
-	result, err := h.chat.SendMessage(c.Request.Context(), authenticated(c).userID, conversationID, draft)
+	ctx, senderID := c.Request.Context(), authenticated(c).userID
+	// 在写入前取得昵称，提交成功后的推送不需要再访问数据库。
+	profiles, err := h.users.ProfilesByIDs(ctx, []int64{senderID})
+	if err != nil {
+		internalError(c, err)
+		return
+	}
+	// 发送者取自 Bearer 凭证，Service 按会话类型判定发送资格。
+	result, err := h.chat.SendMessage(ctx, senderID, conversationID, draft)
 	if err != nil {
 		chatError(c, err)
 		return
 	}
 	// 只推送首次写入的消息；在线通知失败也不能改掉已成功保存的结果。
+	response := newMessageResponse(result.Message, profiles[senderID].Nickname)
 	if result.Created {
-		if err := h.hub.Push(result.RecipientID, realtime.MessageCreated(result.Message)); err != nil {
+		if err := h.hub.PushMessages(result.Recipients, realtime.MessageCreated(response)); err != nil {
 			slog.Warn("message saved but push failed", "message_id", result.Message.ID, "error", err)
 		}
 	}
-	respondSuccess(c, messageResponse(result.Message))
+	respondSuccess(c, response)
 }
 
 func (h *handler) listMessages(c *gin.Context) {
@@ -159,8 +180,39 @@ func (h *handler) listMessages(c *gin.Context) {
 		return
 	}
 	response := make([]messageResponse, len(messages))
+	senderIDs := make([]int64, 0, len(messages))
+	for _, message := range messages {
+		senderIDs = append(senderIDs, message.SenderID)
+	}
+	profiles, err := h.users.ProfilesByIDs(ctx, senderIDs)
+	if err != nil {
+		internalError(c, err)
+		return
+	}
+	packetIDs := make([]int64, 0, len(messages))
+	for _, message := range messages {
+		if message.RedPacketID != nil {
+			packetIDs = append(packetIDs, *message.RedPacketID)
+		}
+	}
+	packetStatuses := make(map[int64]redpacket.Status)
+	if len(packetIDs) > 0 {
+		packetStatuses, err = h.redPackets.Statuses(ctx, packetIDs)
+		if err != nil {
+			internalError(c, err)
+			return
+		}
+	}
 	for i, message := range messages {
-		response[i] = messageResponse(message)
+		response[i] = newMessageResponse(message, profiles[message.SenderID].Nickname)
+		if message.RedPacketID != nil {
+			status, ok := packetStatuses[*message.RedPacketID]
+			if !ok {
+				internalError(c, errors.New("red packet status is missing"))
+				return
+			}
+			response[i].RedPacketStatus = string(status)
+		}
 	}
 	respondSuccess(c, response)
 }
@@ -245,6 +297,22 @@ func chatError(c *gin.Context, err error) {
 		reject(c, "invalid_read_seq")
 	case errors.Is(err, chat.ErrInvalidPageSize):
 		reject(c, "invalid_pagination")
+	case errors.Is(err, chat.ErrGroupUnavailable):
+		reject(c, "group_unavailable")
+	case errors.Is(err, chat.ErrGroupPermission):
+		reject(c, "group_permission")
+	case errors.Is(err, chat.ErrGroupMemberMissing):
+		reject(c, "group_member_missing")
+	case errors.Is(err, chat.ErrGroupLimit):
+		reject(c, "group_limit")
+	case errors.Is(err, chat.ErrGroupInviteFriends):
+		reject(c, "group_invite_friends")
+	case errors.Is(err, chat.ErrOwnerMustTransfer):
+		reject(c, "owner_must_transfer")
+	case errors.Is(err, chat.ErrMessageConflict):
+		reject(c, "message_conflict")
+	case errors.Is(err, chat.ErrPreviousMembershipMessage):
+		reject(c, "previous_membership_message")
 	default:
 		internalError(c, err)
 	}

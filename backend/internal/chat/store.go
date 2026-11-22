@@ -2,6 +2,7 @@ package chat
 
 import (
 	"context"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"strings"
@@ -16,6 +17,7 @@ var (
 	ErrSelfConversation = errors.New("cannot open a direct conversation with yourself")
 	ErrUserNotFound     = errors.New("a conversation participant does not exist")
 	ErrNotMember        = errors.New("not a member of the conversation")
+	ErrMessageConflict  = errors.New("client message ID is used by a different message")
 	ErrInvalidReadSeq   = errors.New("read sequence is outside the conversation")
 )
 
@@ -26,16 +28,27 @@ type Store interface {
 	AreFriendsTx(ctx context.Context, tx *sqlx.Tx, userID, peerID int64) (bool, error)
 	UpsertDirect(ctx context.Context, low, high int64) (int64, error)
 	ListConversations(ctx context.Context, userID int64) ([]ConversationSummary, error)
-	IsMember(ctx context.Context, userID, conversationID int64) (bool, error)
-	LastSequence(ctx context.Context, conversationID int64) (int64, error)
+	Membership(ctx context.Context, tx *sqlx.Tx, conversationID, userID int64) (Member, error)
 	AdvanceRead(ctx context.Context, userID, conversationID, seq int64) error
 	BeginTx(ctx context.Context) (*sqlx.Tx, error)
-	LockDirectConversation(ctx context.Context, tx *sqlx.Tx, id int64) (DirectConversation, error)
+	BeginSnapshot(ctx context.Context) (*sqlx.Tx, error)
+	LockConversation(ctx context.Context, tx *sqlx.Tx, id int64) (Conversation, error)
+	GetConversation(ctx context.Context, tx *sqlx.Tx, id int64) (Conversation, error)
+	InsertGroup(ctx context.Context, tx *sqlx.Tx, name string) (int64, error)
+	ActiveMembers(ctx context.Context, tx *sqlx.Tx, id int64) ([]Member, error)
+	AddMembers(ctx context.Context, tx *sqlx.Tx, id, joinedSeq int64, role Role, userIDs []int64) error
+	CountFriends(ctx context.Context, tx *sqlx.Tx, actor int64, ids []int64) (int, error)
+	RenameGroup(ctx context.Context, tx *sqlx.Tx, id int64, name string) error
+	SetRole(ctx context.Context, tx *sqlx.Tx, id, userID int64, role Role) error
+	RemoveMember(ctx context.Context, tx *sqlx.Tx, id, userID int64) error
+	CloseGroup(ctx context.Context, tx *sqlx.Tx, id int64) error
 	FindSentMessage(ctx context.Context, tx *sqlx.Tx, conversationID, userID int64, clientMsgID string) (Message, error)
 	InsertMessage(ctx context.Context, tx *sqlx.Tx, message Message) (int64, error)
 	UpdateLastMessage(ctx context.Context, tx *sqlx.Tx, message Message) error
-	History(ctx context.Context, conversationID, beforeSeq int64, limit int) ([]Message, error)
-	Sync(ctx context.Context, conversationID, afterSeq int64, limit int) ([]Message, error)
+	PacketMessage(ctx context.Context, tx *sqlx.Tx, packetID int64) (Message, error)
+	MessageByID(ctx context.Context, tx *sqlx.Tx, messageID int64) (Message, error)
+	History(ctx context.Context, tx *sqlx.Tx, conversationID, joinedSeq, beforeSeq int64, limit int) ([]Message, error)
+	Sync(ctx context.Context, tx *sqlx.Tx, conversationID, afterSeq int64, limit int) ([]Message, error)
 }
 
 type mysqlStore struct {
@@ -50,11 +63,15 @@ func NewStore(db *sqlx.DB) Store {
 }
 
 type ConversationSummary struct {
-	ID             int64 `db:"id"`
-	PeerUserID     int64 `db:"peer_user_id"`
-	LastSeq        int64 `db:"last_seq"`
+	ID             int64  `db:"id"`
+	PeerUserID     int64  `db:"peer_user_id"`
+	LastSeq        int64  `db:"last_seq"`
+	Kind           Kind   `db:"kind"`
+	GroupName      string `db:"group_name"`
+	JoinedSeq      int64
 	LastReadSeq    int64
 	LastActivityAt time.Time `db:"last_activity_at"`
+	LastMessage    string
 	UnreadCount    int64
 }
 
@@ -112,13 +129,20 @@ func (s *mysqlStore) UpsertDirect(ctx context.Context, low, high int64) (int64, 
 
 // ListConversations 查询用户的会话摘要和个人已读游标。
 func (s *mysqlStore) ListConversations(ctx context.Context, userID int64) ([]ConversationSummary, error) {
+	// 会话摘要的成员资格、正文和未读数读取同一个快照。
+	tx, err := s.BeginSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
 	// 先从成员表拿到会话 ID 和个人已读游标，再按 ID 批量查会话。
 	var memberships []struct {
 		ConversationID int64 `db:"conversation_id"`
 		LastReadSeq    int64 `db:"last_read_seq"`
+		JoinedSeq      int64 `db:"joined_seq"`
 	}
-	if err := s.db.SelectContext(ctx, &memberships, `
-		SELECT conversation_id, last_read_seq FROM conversation_members WHERE user_id = ?`, userID); err != nil {
+	if err := tx.SelectContext(ctx, &memberships, `
+		SELECT conversation_id, last_read_seq, joined_seq FROM conversation_members WHERE user_id = ? AND left_at IS NULL`, userID); err != nil {
 		return nil, err
 	}
 	conversations := []ConversationSummary{}
@@ -128,32 +152,69 @@ func (s *mysqlStore) ListConversations(ctx context.Context, userID int64) ([]Con
 
 	ids := make([]int64, 0, len(memberships))
 	readSeqs := make(map[int64]int64, len(memberships))
+	joinedSeqs := make(map[int64]int64, len(memberships))
 	for _, member := range memberships {
 		ids = append(ids, member.ConversationID)
 		readSeqs[member.ConversationID] = member.LastReadSeq
+		joinedSeqs[member.ConversationID] = member.JoinedSeq
 	}
 	query, args, err := sqlx.In(`
-		SELECT id, IF(direct_user_low_id = ?, direct_user_high_id, direct_user_low_id) AS peer_user_id,
-		       last_seq, last_activity_at
-		FROM conversations WHERE id IN (?) ORDER BY last_activity_at DESC, id DESC`, userID, ids)
+		SELECT id, COALESCE(IF(direct_user_low_id = ?, direct_user_high_id, direct_user_low_id), 0) AS peer_user_id,
+		       kind, COALESCE(group_name, '') AS group_name, last_seq, last_activity_at
+		FROM conversations WHERE id IN (?) AND closed_at IS NULL ORDER BY last_activity_at DESC, id DESC`, userID, ids)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.db.SelectContext(ctx, &conversations, query, args...); err != nil {
+	if err := tx.SelectContext(ctx, &conversations, query, args...); err != nil {
 		return nil, err
 	}
 	for i := range conversations {
 		conversations[i].LastReadSeq = readSeqs[conversations[i].ID]
+		conversations[i].JoinedSeq = joinedSeqs[conversations[i].ID]
+	}
+	if err := s.fillLastMessages(ctx, tx, conversations); err != nil {
+		return nil, err
 	}
 	// 按各会话的已读游标批量统计未读，排除当前用户自己发的消息。
-	if err := s.fillUnreadCounts(ctx, userID, conversations); err != nil {
+	if err := s.fillUnreadCounts(ctx, tx, userID, conversations); err != nil {
 		return nil, err
 	}
 	return conversations, nil
 }
 
+// fillLastMessages 用会话 ID 和最新序号批量读取摘要对应的正文。
+func (s *mysqlStore) fillLastMessages(ctx context.Context, tx *sqlx.Tx, conversations []ConversationSummary) error {
+	keys := make([]string, 0, len(conversations))
+	args := make([]any, 0, 2*len(conversations))
+	byID := make(map[int64]*ConversationSummary, len(conversations))
+	for i := range conversations {
+		item := &conversations[i]
+		if item.LastSeq <= item.JoinedSeq {
+			continue
+		}
+		keys = append(keys, "(?, ?)")
+		args = append(args, item.ID, item.LastSeq)
+		byID[item.ID] = item
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	var messages []struct {
+		ConversationID int64  `db:"conversation_id"`
+		Content        string `db:"content"`
+	}
+	if err := tx.SelectContext(ctx, &messages, `SELECT conversation_id, content FROM messages
+		WHERE (conversation_id, seq) IN (`+strings.Join(keys, ", ")+`)`, args...); err != nil {
+		return err
+	}
+	for _, message := range messages {
+		byID[message.ConversationID].LastMessage = message.Content
+	}
+	return nil
+}
+
 // fillUnreadCounts 按会话汇总游标之后由其他人发送的消息。
-func (s *mysqlStore) fillUnreadCounts(ctx context.Context, userID int64, conversations []ConversationSummary) error {
+func (s *mysqlStore) fillUnreadCounts(ctx context.Context, tx *sqlx.Tx, userID int64, conversations []ConversationSummary) error {
 	ranges := make([]string, 0, len(conversations))
 	args := []any{userID}
 	byID := make(map[int64]*ConversationSummary, len(conversations))
@@ -174,7 +235,7 @@ func (s *mysqlStore) fillUnreadCounts(ctx context.Context, userID int64, convers
 		ConversationID int64 `db:"conversation_id"`
 		UnreadCount    int64 `db:"unread_count"`
 	}
-	if err := s.db.SelectContext(ctx, &counts, `
+	if err := tx.SelectContext(ctx, &counts, `
 		SELECT conversation_id, COUNT(*) AS unread_count FROM messages
 		WHERE sender_id <> ? AND (`+strings.Join(ranges, ` OR `)+`) GROUP BY conversation_id`, args...); err != nil {
 		return err
@@ -185,27 +246,12 @@ func (s *mysqlStore) fillUnreadCounts(ctx context.Context, userID int64, convers
 	return nil
 }
 
-// IsMember 检查用户是否有权访问指定会话。
-func (s *mysqlStore) IsMember(ctx context.Context, userID, conversationID int64) (bool, error) {
-	var member bool
-	err := s.db.GetContext(ctx, &member, `
-		SELECT EXISTS (SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ?)`, conversationID, userID)
-	return member, err
-}
-
-// LastSequence 查询会话中已经分配的最新消息序号。
-func (s *mysqlStore) LastSequence(ctx context.Context, conversationID int64) (int64, error) {
-	var lastSeq int64
-	err := s.db.GetContext(ctx, &lastSeq, `SELECT last_seq FROM conversations WHERE id = ?`, conversationID)
-	return lastSeq, err
-}
-
 // AdvanceRead 单向推进成员的已读游标。
 func (s *mysqlStore) AdvanceRead(ctx context.Context, userID, conversationID, seq int64) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE conversation_members
 		SET last_read_seq = GREATEST(last_read_seq, ?)
-		WHERE conversation_id = ? AND user_id = ?`, seq, conversationID, userID)
+		WHERE conversation_id = ? AND user_id = ? AND left_at IS NULL AND joined_seq <= ?`, seq, conversationID, userID, seq)
 	return err
 }
 
@@ -221,42 +267,55 @@ type MessageDraft struct {
 }
 
 // NewMessageDraft 校验并规范化 HTTP 入口传入的消息草稿。
-func NewMessageDraft(clientMsgID, content string) (MessageDraft, error) {
+func ParseClientMessageID(clientMsgID string) (string, error) {
 	if len(clientMsgID) != 36 || clientMsgID[8] != '-' || clientMsgID[13] != '-' ||
 		clientMsgID[18] != '-' || clientMsgID[23] != '-' {
-		return MessageDraft{}, ErrInvalidClientMsgID
+		return "", ErrInvalidClientMsgID
 	}
 	if decoded, err := hex.DecodeString(strings.ReplaceAll(clientMsgID, "-", "")); err != nil || len(decoded) != 16 {
-		return MessageDraft{}, ErrInvalidClientMsgID
+		return "", ErrInvalidClientMsgID
 	}
+	return strings.ToLower(clientMsgID), nil
+}
+
+func NewMessageDraft(clientMsgID, content string) (MessageDraft, error) {
+	clientMsgID, err := ParseClientMessageID(clientMsgID)
+	if err != nil {
+		return MessageDraft{}, err
+	}
+
 	if !utf8.ValidString(content) || strings.TrimSpace(content) == "" || utf8.RuneCountInString(content) > 2000 {
 		return MessageDraft{}, ErrInvalidContent
 	}
-	return MessageDraft{clientMsgID: strings.ToLower(clientMsgID), content: content}, nil
+	return MessageDraft{clientMsgID: clientMsgID, content: content}, nil
 }
+
+type MessageKind string
+
+const (
+	TextMessage           MessageKind = "text"
+	RedPacketMessage      MessageKind = "red_packet"
+	RedPacketClaimMessage MessageKind = "red_packet_claim"
+)
 
 type Message struct {
-	ID             int64     `db:"id"`
-	ConversationID int64     `db:"conversation_id"`
-	SenderID       int64     `db:"sender_id"`
-	ClientMsgID    string    `db:"client_msg_id"`
-	Seq            int64     `db:"seq"`
-	Content        string    `db:"content"`
-	CreatedAt      time.Time `db:"created_at"`
+	Kind           MessageKind `db:"kind"`
+	RedPacketID    *int64      `db:"red_packet_id"`
+	ID             int64       `db:"id"`
+	ConversationID int64       `db:"conversation_id"`
+	SenderID       int64       `db:"sender_id"`
+	ClientMsgID    string      `db:"client_msg_id"`
+	Seq            int64       `db:"seq"`
+	Content        string      `db:"content"`
+	CreatedAt      time.Time   `db:"created_at"`
 }
 
-const selectMessage = `SELECT id, conversation_id, sender_id, client_msg_id, seq, content, created_at FROM messages`
+const selectMessage = `SELECT id, conversation_id, sender_id, client_msg_id, seq, content, created_at, kind, red_packet_id FROM messages`
 
 type SendResult struct {
-	Message     Message
-	RecipientID int64
-	Created     bool
-}
-
-type DirectConversation struct {
-	LastSeq int64 `db:"last_seq"`
-	LowID   int64 `db:"direct_user_low_id"`
-	HighID  int64 `db:"direct_user_high_id"`
+	Message    Message
+	Recipients []int64
+	Created    bool
 }
 
 // BeginTx 为一次消息发送创建数据库事务。
@@ -264,12 +323,9 @@ func (s *mysqlStore) BeginTx(ctx context.Context) (*sqlx.Tx, error) {
 	return s.db.BeginTxx(ctx, nil)
 }
 
-// LockDirectConversation 锁定会话行，读取分配下一条消息所需的数据。
-func (s *mysqlStore) LockDirectConversation(ctx context.Context, tx *sqlx.Tx, id int64) (DirectConversation, error) {
-	var conversation DirectConversation
-	err := tx.GetContext(ctx, &conversation, `
-		SELECT last_seq, direct_user_low_id, direct_user_high_id FROM conversations WHERE id = ? FOR UPDATE`, id)
-	return conversation, err
+// BeginSnapshot 保证多个读取操作看到相同的成员状态和消息版本。
+func (s *mysqlStore) BeginSnapshot(ctx context.Context) (*sqlx.Tx, error) {
+	return s.db.BeginTxx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
 }
 
 // FindSentMessage 按客户端消息标识查找已保存的发送结果。
@@ -283,8 +339,8 @@ func (s *mysqlStore) FindSentMessage(ctx context.Context, tx *sqlx.Tx, conversat
 // InsertMessage 将新消息写入消息表并返回数据库消息 ID。
 func (s *mysqlStore) InsertMessage(ctx context.Context, tx *sqlx.Tx, message Message) (int64, error) {
 	result, err := tx.ExecContext(ctx, `
-		INSERT INTO messages (conversation_id, sender_id, client_msg_id, seq, content, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)`, message.ConversationID, message.SenderID, message.ClientMsgID, message.Seq, message.Content, message.CreatedAt)
+		INSERT INTO messages (conversation_id, sender_id, client_msg_id, seq, content, created_at, kind, red_packet_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, message.ConversationID, message.SenderID, message.ClientMsgID, message.Seq, message.Content, message.CreatedAt, message.Kind, message.RedPacketID)
 	if err != nil {
 		return 0, err
 	}
@@ -299,28 +355,167 @@ func (s *mysqlStore) UpdateLastMessage(ctx context.Context, tx *sqlx.Tx, message
 }
 
 // History 按序号倒序读取会话历史消息。
-func (s *mysqlStore) History(ctx context.Context, conversationID, beforeSeq int64, limit int) ([]Message, error) {
-	query := selectMessage + ` WHERE conversation_id = ?`
-	args := []any{conversationID}
+func (s *mysqlStore) History(ctx context.Context, tx *sqlx.Tx, conversationID, joinedSeq, beforeSeq int64, limit int) ([]Message, error) {
+	query := selectMessage + ` WHERE conversation_id = ? AND seq > ?`
+	args := []any{conversationID, joinedSeq}
 	if beforeSeq != 0 {
 		query += ` AND seq < ?`
 		args = append(args, beforeSeq)
 	}
-	return s.queryMessages(ctx, query+` ORDER BY seq DESC LIMIT ?`, append(args, limit)...)
+	return s.queryMessages(ctx, tx, query+` ORDER BY seq DESC LIMIT ?`, append(args, limit)...)
 }
 
 // Sync 按序号正序读取设备游标之后的新消息。
-func (s *mysqlStore) Sync(ctx context.Context, conversationID, afterSeq int64, limit int) ([]Message, error) {
-	return s.queryMessages(ctx,
+func (s *mysqlStore) Sync(ctx context.Context, tx *sqlx.Tx, conversationID, afterSeq int64, limit int) ([]Message, error) {
+	return s.queryMessages(ctx, tx,
 		selectMessage+` WHERE conversation_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?`,
 		conversationID, afterSeq, limit)
 }
 
 // queryMessages 执行历史或增量查询并映射消息记录。
-func (s *mysqlStore) queryMessages(ctx context.Context, query string, args ...any) ([]Message, error) {
+func (s *mysqlStore) queryMessages(ctx context.Context, tx *sqlx.Tx, query string, args ...any) ([]Message, error) {
 	messages := []Message{}
-	if err := s.db.SelectContext(ctx, &messages, query, args...); err != nil {
+	if err := tx.SelectContext(ctx, &messages, query, args...); err != nil {
 		return nil, err
 	}
 	return messages, nil
+}
+
+type Kind string
+
+const (
+	Direct Kind = "direct"
+	Group  Kind = "group"
+)
+
+type Role string
+
+const (
+	Owner  Role = "owner"
+	Admin  Role = "admin"
+	Normal Role = "member"
+)
+
+type Conversation struct {
+	ID       int64        `db:"id"`
+	Kind     Kind         `db:"kind"`
+	Name     string       `db:"group_name"`
+	LastSeq  int64        `db:"last_seq"`
+	LowID    int64        `db:"direct_user_low_id"`
+	HighID   int64        `db:"direct_user_high_id"`
+	ClosedAt sql.NullTime `db:"closed_at"`
+}
+
+type Member struct {
+	UserID    int64 `db:"user_id"`
+	Role      Role  `db:"role"`
+	JoinedSeq int64 `db:"joined_seq"`
+}
+
+const selectConversation = `SELECT id, kind, COALESCE(group_name, '') AS group_name, last_seq,
+	COALESCE(direct_user_low_id, 0) AS direct_user_low_id, COALESCE(direct_user_high_id, 0) AS direct_user_high_id,
+	closed_at FROM conversations WHERE id = ?`
+
+// GetConversation 读取会话状态，调用方通过只读事务保持查询范围一致。
+func (s *mysqlStore) GetConversation(ctx context.Context, tx *sqlx.Tx, id int64) (Conversation, error) {
+	var conversation Conversation
+	err := tx.GetContext(ctx, &conversation, selectConversation, id)
+	return conversation, err
+}
+
+// LockConversation 让同一会话的序号分配和成员变更共用行锁。
+func (s *mysqlStore) LockConversation(ctx context.Context, tx *sqlx.Tx, id int64) (Conversation, error) {
+	var conversation Conversation
+	err := tx.GetContext(ctx, &conversation, selectConversation+` FOR UPDATE`, id)
+	return conversation, err
+}
+
+// Membership 查询用户当前有效的成员记录及可读起点。
+func (s *mysqlStore) Membership(ctx context.Context, tx *sqlx.Tx, conversationID, userID int64) (Member, error) {
+	var member Member
+	err := tx.GetContext(ctx, &member, `SELECT user_id, role, joined_seq FROM conversation_members
+		WHERE conversation_id = ? AND user_id = ? AND left_at IS NULL`, conversationID, userID)
+	return member, err
+}
+
+// ActiveMembers 一次读取所有在群的成员，供角色判断和推送选择使用。
+func (s *mysqlStore) ActiveMembers(ctx context.Context, tx *sqlx.Tx, id int64) ([]Member, error) {
+	var members []Member
+	err := tx.SelectContext(ctx, &members, `SELECT user_id, role, joined_seq FROM conversation_members
+		WHERE conversation_id = ? AND left_at IS NULL ORDER BY user_id`, id)
+	return members, err
+}
+
+// InsertGroup 保存群会话，群主由 Service 在同一事务中写入。
+func (s *mysqlStore) InsertGroup(ctx context.Context, tx *sqlx.Tx, name string) (int64, error) {
+	result, err := tx.ExecContext(ctx, `INSERT INTO conversations (kind, group_name) VALUES ('group', ?)`, name)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
+// AddMembers 批量写入新成员；重新加入时覆盖成员的角色和可读起点。
+func (s *mysqlStore) AddMembers(ctx context.Context, tx *sqlx.Tx, id, joinedSeq int64, role Role, userIDs []int64) error {
+	values := make([]string, 0, len(userIDs))
+	args := make([]any, 0, 5*len(userIDs)+3)
+	for _, userID := range userIDs {
+		values = append(values, "(?, ?, ?, ?, ?)")
+		args = append(args, id, userID, role, joinedSeq, joinedSeq)
+	}
+	args = append(args, role, joinedSeq, joinedSeq)
+	_, err := tx.ExecContext(ctx, `INSERT INTO conversation_members (conversation_id, user_id, role, joined_seq, last_read_seq)
+		VALUES `+strings.Join(values, ", ")+` ON DUPLICATE KEY UPDATE role = ?, joined_seq = ?, last_read_seq = ?,
+		joined_at = CURRENT_TIMESTAMP(6), left_at = NULL`, args...)
+	return err
+}
+
+// CountFriends 批量检查邀请对象与操作者的已接受好友关系。
+func (s *mysqlStore) CountFriends(ctx context.Context, tx *sqlx.Tx, actor int64, ids []int64) (int, error) {
+	query, args, err := sqlx.In(`SELECT COUNT(*) FROM friendships WHERE status = 'accepted'
+		AND ((user_low_id = ? AND user_high_id IN (?)) OR (user_high_id = ? AND user_low_id IN (?)))`, actor, ids, actor, ids)
+	if err != nil {
+		return 0, err
+	}
+	var count int
+	err = tx.GetContext(ctx, &count, query, args...)
+	return count, err
+}
+
+// RenameGroup 更新会话标题，保留最近发消息的活动时间。
+func (s *mysqlStore) RenameGroup(ctx context.Context, tx *sqlx.Tx, id int64, name string) error {
+	_, err := tx.ExecContext(ctx, `UPDATE conversations SET group_name = ? WHERE id = ?`, name, id)
+	return err
+}
+
+// SetRole 更新在群成员的群内角色。
+func (s *mysqlStore) SetRole(ctx context.Context, tx *sqlx.Tx, id, userID int64, role Role) error {
+	_, err := tx.ExecContext(ctx, `UPDATE conversation_members SET role = ? WHERE conversation_id = ? AND user_id = ?`, role, id, userID)
+	return err
+}
+
+// RemoveMember 记录本次退群时间，保留成员和历史消息记录。
+func (s *mysqlStore) RemoveMember(ctx context.Context, tx *sqlx.Tx, id, userID int64) error {
+	_, err := tx.ExecContext(ctx, `UPDATE conversation_members SET left_at = CURRENT_TIMESTAMP(6) WHERE conversation_id = ? AND user_id = ?`, id, userID)
+	return err
+}
+
+// CloseGroup 记录最后一名群成员退出的时间。
+func (s *mysqlStore) CloseGroup(ctx context.Context, tx *sqlx.Tx, id int64) error {
+	_, err := tx.ExecContext(ctx, `UPDATE conversations SET closed_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, id)
+	return err
+}
+
+// PacketMessage 按红包 ID 查询对应的聊天卡片。
+func (s *mysqlStore) PacketMessage(ctx context.Context, tx *sqlx.Tx, packetID int64) (Message, error) {
+	var message Message
+	err := tx.GetContext(ctx, &message, selectMessage+` WHERE red_packet_id = ?`, packetID)
+	return message, err
+}
+
+// MessageByID 按全局消息标识读取已保存的聊天消息。
+func (s *mysqlStore) MessageByID(ctx context.Context, tx *sqlx.Tx, messageID int64) (Message, error) {
+	var message Message
+	err := tx.GetContext(ctx, &message, selectMessage+` WHERE id = ?`, messageID)
+	return message, err
 }

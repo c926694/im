@@ -131,7 +131,7 @@ func TestStoreMySQL(t *testing.T) {
 	}
 	created := 0
 	for _, retry := range retries {
-		if retry.Message != first || retry.RecipientID != bob {
+		if retry.Message != first || !slices.Equal(retry.Recipients, []int64{bob}) {
 			t.Fatalf("retry returned %+v, want %+v", retry, first)
 		}
 		if retry.Created {
@@ -151,7 +151,7 @@ func TestStoreMySQL(t *testing.T) {
 	})
 	// The same client ID belongs to a different request when the sender differs.
 	reply, err := store.SendMessage(ctx, bob, conversationID, messageDraft(t, clientMsgID, "reply"))
-	if err != nil || reply.Message.Seq != 10 || reply.RecipientID != alice || !reply.Created {
+	if err != nil || reply.Message.Seq != 10 || !slices.Equal(reply.Recipients, []int64{alice}) || !reply.Created {
 		t.Fatalf("reply = %+v, err = %v; want seq 10", reply, err)
 	}
 

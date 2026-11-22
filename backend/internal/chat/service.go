@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/c926694/im/backend/internal/friendship"
+	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
 )
 
 // Service 组合聊天业务流程，并通过 Store 执行数据库读写。
@@ -44,37 +46,67 @@ func (s *Service) CreateDirect(ctx context.Context, userID, peerID int64) (int64
 	return s.store.UpsertDirect(ctx, min(userID, peerID), max(userID, peerID))
 }
 
-// SendMessage 检查权限和好友状态，在一个事务内保存消息并推进会话序号。
+// SendMessage 检查当前会话权限，在一个事务内保存消息并推进序号。
 func (s *Service) SendMessage(ctx context.Context, userID, conversationID int64, draft MessageDraft) (SendResult, error) {
-	// 会话成员资格是读取该会话和发送消息的前提。
-	if err := s.requireMember(ctx, userID, conversationID); err != nil {
-		return SendResult{}, err
-	}
 	tx, err := s.store.BeginTx(ctx)
 	if err != nil {
 		return SendResult{}, err
 	}
 	defer tx.Rollback()
 
-	// 锁住会话行，保证并发写入分配不同的序号。
-	conversation, err := s.store.LockDirectConversation(ctx, tx, conversationID)
+	result, err := s.SaveMessage(ctx, tx, userID, conversationID, draft.clientMsgID, TextMessage,
+		func(_ Kind, _ []int64, message *Message) error {
+			message.Content = draft.content
+			return nil
+		})
 	if err != nil {
 		return SendResult{}, err
 	}
-	recipientID := conversation.LowID
-	if userID == conversation.LowID {
-		recipientID = conversation.HighID
+	return result, tx.Commit()
+}
+
+// SaveMessage 在调用方的事务中保存聊天消息。prepare 仅在新消息通过权限检查后执行。
+func (s *Service) SaveMessage(ctx context.Context, tx *sqlx.Tx, userID, conversationID int64,
+	clientMsgID string, kind MessageKind, prepare func(Kind, []int64, *Message) error) (SendResult, error) {
+
+	// 群成员资格与消息序号采用同一个写入顺序。
+	conversation, err := s.store.LockConversation(ctx, tx, conversationID)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && conversation.ClosedAt.Valid) {
+		return SendResult{}, ErrNotMember
+	}
+	if err != nil {
+		return SendResult{}, err
+	}
+	member, err := s.requireMember(ctx, tx, userID, conversationID)
+	if err != nil {
+		return SendResult{}, err
 	}
 
-	// 首次普通查询读取好友状态；通过检查的发送可以在解除好友后提交。
-	accepted, err := s.store.AreFriendsTx(ctx, tx, userID, recipientID)
-	if err != nil {
-		return SendResult{}, err
+	result := SendResult{}
+	accepted := true
+	if conversation.Kind == Direct {
+		recipientID := conversation.LowID
+		if userID == conversation.LowID {
+			recipientID = conversation.HighID
+		}
+		result.Recipients = []int64{recipientID}
+		// 好友状态按普通查询判定，不锁好友关系。
+		accepted, err = s.store.AreFriendsTx(ctx, tx, userID, recipientID)
+		if err != nil {
+			return SendResult{}, err
+		}
 	}
-	// 已提交的请求仍可返回原结果，解除好友只限制新消息。
-	message, err := s.store.FindSentMessage(ctx, tx, conversationID, userID, draft.clientMsgID)
+	// 只返回本次入群以来的发送结果；单聊解除好友后仍可取回已保存的请求。
+	message, err := s.store.FindSentMessage(ctx, tx, conversationID, userID, clientMsgID)
 	if err == nil {
-		return SendResult{Message: message, RecipientID: recipientID}, nil
+		if message.Seq <= member.JoinedSeq {
+			return SendResult{}, ErrPreviousMembershipMessage
+		}
+		if message.Kind != kind {
+			return SendResult{}, ErrMessageConflict
+		}
+		result.Message = message
+		return result, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return SendResult{}, err
@@ -84,8 +116,18 @@ func (s *Service) SendMessage(ctx context.Context, userID, conversationID int64,
 	}
 
 	message = Message{
-		ConversationID: conversationID, SenderID: userID, ClientMsgID: draft.clientMsgID,
-		Seq: conversation.LastSeq + 1, Content: draft.content, CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
+		ConversationID: conversationID, SenderID: userID, ClientMsgID: clientMsgID, Kind: kind,
+		Seq: conversation.LastSeq + 1, CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
+	}
+	if conversation.Kind == Group {
+		members, err := s.store.ActiveMembers(ctx, tx, conversationID)
+		if err != nil {
+			return SendResult{}, err
+		}
+		result.Recipients = memberIDs(members)
+	}
+	if err := prepare(conversation.Kind, result.Recipients, &message); err != nil {
+		return SendResult{}, err
 	}
 	// 写入消息与会话游标使用同一个事务，提交后才确认和推送。
 	message.ID, err = s.store.InsertMessage(ctx, tx, message)
@@ -95,10 +137,10 @@ func (s *Service) SendMessage(ctx context.Context, userID, conversationID int64,
 	if err := s.store.UpdateLastMessage(ctx, tx, message); err != nil {
 		return SendResult{}, err
 	}
-	if err := tx.Commit(); err != nil {
-		return SendResult{}, err
-	}
-	return SendResult{Message: message, RecipientID: recipientID, Created: true}, nil
+
+	result.Message = message
+	result.Created = true
+	return result, nil
 }
 
 // ListConversations 查询当前用户可访问的会话摘要。
@@ -108,60 +150,172 @@ func (s *Service) ListConversations(ctx context.Context, userID int64) ([]Conver
 
 // History 检查会话成员身份后读取较早的历史消息。
 func (s *Service) History(ctx context.Context, userID, conversationID, beforeSeq int64, limit int) ([]Message, error) {
-	limit, err := s.messagePageLimit(ctx, userID, conversationID, limit)
-	if err != nil {
-		return nil, err
-	}
-	return s.store.History(ctx, conversationID, beforeSeq, limit)
+	return s.readMessages(ctx, userID, conversationID, beforeSeq, limit, false)
 }
 
 // Sync 检查会话成员身份后按设备游标补取新消息。
 func (s *Service) Sync(ctx context.Context, userID, conversationID, afterSeq int64, limit int) ([]Message, error) {
-	limit, err := s.messagePageLimit(ctx, userID, conversationID, limit)
-	if err != nil {
-		return nil, err
-	}
-	// 按设备的同步游标升序补拉，解除好友后仍可读取已保存的消息。
-	return s.store.Sync(ctx, conversationID, afterSeq, limit)
+	return s.readMessages(ctx, userID, conversationID, afterSeq, limit, true)
 }
 
-// messagePageLimit 采用默认页数并确认请求用户属于会话。
-func (s *Service) messagePageLimit(ctx context.Context, userID, conversationID int64, limit int) (int, error) {
+// readMessages 在同一个快照中读取成员资格和可见消息。
+func (s *Service) readMessages(ctx context.Context, userID, conversationID, cursor int64, limit int, forward bool) ([]Message, error) {
 	if limit == 0 {
 		limit = 50
 	}
 	if limit < 1 || limit > 100 {
-		return 0, ErrInvalidPageSize
+		return nil, ErrInvalidPageSize
 	}
-	// 读取历史只检查成员资格，好友关系变更不影响同步。
-	return limit, s.requireMember(ctx, userID, conversationID)
+	tx, err := s.store.BeginSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	member, err := s.requireMember(ctx, tx, userID, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	if forward {
+		return s.store.Sync(ctx, tx, conversationID, max(cursor, member.JoinedSeq), limit)
+	}
+	return s.store.History(ctx, tx, conversationID, member.JoinedSeq, cursor, limit)
 }
 
 // requireMember 使用成员记录判断用户是否能访问会话。
-func (s *Service) requireMember(ctx context.Context, userID, conversationID int64) error {
-	member, err := s.store.IsMember(ctx, userID, conversationID)
-	if err != nil {
-		return err
+func (s *Service) requireMember(ctx context.Context, tx *sqlx.Tx, userID, conversationID int64) (Member, error) {
+	member, err := s.store.Membership(ctx, tx, conversationID, userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Member{}, ErrNotMember
 	}
-	if !member {
-		return ErrNotMember
-	}
-	return nil
+	return member, err
 }
 
 // MarkRead 检查成员身份和会话最新序号后推进已读位置。
 func (s *Service) MarkRead(ctx context.Context, userID, conversationID, seq int64) error {
-	if err := s.requireMember(ctx, userID, conversationID); err != nil {
-		return err
-	}
-	// 只能将已读进度标记到已保存的消息。
-	lastSeq, err := s.store.LastSequence(ctx, conversationID)
+	tx, err := s.store.BeginSnapshot(ctx)
 	if err != nil {
 		return err
 	}
-	if seq < 0 || seq > lastSeq {
+	defer tx.Rollback()
+	member, err := s.requireMember(ctx, tx, userID, conversationID)
+	if err != nil {
+		return err
+	}
+	// 只能将已读进度标记到已保存的消息。
+	conversation, err := s.store.GetConversation(ctx, tx, conversationID)
+	if err != nil {
+		return err
+	}
+	if seq < member.JoinedSeq || seq > conversation.LastSeq {
 		return ErrInvalidReadSeq
 	}
-	// 旧设备上报的游标不能覆盖更新的已读进度。
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// 更新时限定有效成员和可读起点，避免旧请求推进重新加入后的进度。
 	return s.store.AdvanceRead(ctx, userID, conversationID, seq)
+}
+
+// VisiblePacketMessage 将卡片查询限制在当前成员本次加入后可见的历史内。
+func (s *Service) VisiblePacketMessage(ctx context.Context, tx *sqlx.Tx, packetID, userID int64) (Message, error) {
+	message, err := s.store.PacketMessage(ctx, tx, packetID)
+	if err != nil {
+		return Message{}, err
+	}
+	member, err := s.requireMember(ctx, tx, userID, message.ConversationID)
+	if err != nil {
+		return Message{}, err
+	}
+	if message.Seq <= member.JoinedSeq {
+		return Message{}, ErrNotMember
+	}
+	return message, nil
+}
+
+// SavePacketClaimMessage 在红包领取事务内写入可同步的聊天通知。
+func (s *Service) SavePacketClaimMessage(ctx context.Context, tx *sqlx.Tx, packetID, userID int64) (Message, error) {
+	packetMessage, err := s.store.PacketMessage(ctx, tx, packetID)
+	if err != nil {
+		return Message{}, err
+	}
+	conversation, err := s.store.LockConversation(ctx, tx, packetMessage.ConversationID)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && conversation.ClosedAt.Valid) {
+		return Message{}, ErrNotMember
+	}
+	if err != nil {
+		return Message{}, err
+	}
+	member, err := s.requireMember(ctx, tx, userID, conversation.ID)
+	if err != nil {
+		return Message{}, err
+	}
+	if packetMessage.Seq <= member.JoinedSeq {
+		return Message{}, ErrNotMember
+	}
+
+	message := Message{
+		ConversationID: conversation.ID,
+		SenderID:       userID,
+		ClientMsgID:    uuid.NewString(),
+		Seq:            conversation.LastSeq + 1,
+		Content:        "领取了红包",
+		CreatedAt:      time.Now().UTC().Truncate(time.Microsecond),
+		Kind:           RedPacketClaimMessage,
+	}
+	message.ID, err = s.store.InsertMessage(ctx, tx, message)
+	if err != nil {
+		return Message{}, err
+	}
+	if err := s.store.UpdateLastMessage(ctx, tx, message); err != nil {
+		return Message{}, err
+	}
+	return message, nil
+}
+
+// PacketAudience 以同一读取快照取得卡片和当前有权查看的在线通知对象。
+func (s *Service) PacketAudience(ctx context.Context, packetID int64) (Message, []int64, error) {
+	tx, err := s.store.BeginSnapshot(ctx)
+	if err != nil {
+		return Message{}, nil, err
+	}
+	defer tx.Rollback()
+	message, err := s.store.PacketMessage(ctx, tx, packetID)
+	if err != nil {
+		return Message{}, nil, err
+	}
+	members, err := s.store.ActiveMembers(ctx, tx, message.ConversationID)
+	if err != nil {
+		return Message{}, nil, err
+	}
+	ids := make([]int64, 0, len(members))
+	for _, member := range members {
+		if message.Seq > member.JoinedSeq {
+			ids = append(ids, member.UserID)
+		}
+	}
+	return message, ids, nil
+}
+
+// MessageAudience 根据消息序号筛选当前有权接收该消息通知的会话成员。
+func (s *Service) MessageAudience(ctx context.Context, messageID int64) (Message, []int64, error) {
+	tx, err := s.store.BeginSnapshot(ctx)
+	if err != nil {
+		return Message{}, nil, err
+	}
+	defer tx.Rollback()
+	message, err := s.store.MessageByID(ctx, tx, messageID)
+	if err != nil {
+		return Message{}, nil, err
+	}
+	members, err := s.store.ActiveMembers(ctx, tx, message.ConversationID)
+	if err != nil {
+		return Message{}, nil, err
+	}
+	ids := make([]int64, 0, len(members))
+	for _, member := range members {
+		if message.Seq > member.JoinedSeq {
+			ids = append(ids, member.UserID)
+		}
+	}
+	return message, ids, nil
 }

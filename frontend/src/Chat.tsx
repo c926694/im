@@ -1,26 +1,36 @@
 import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState } from "react";
 import type { Dispatch, FormEvent } from "react";
-import { APIError, errorCode, pageSize } from "./api";
-import type { ChatAPI, Conversation, Draft } from "./api";
+import { APIError, conversationTitle, errorCode, pageSize } from "./api";
+import type { ChatAPI, Conversation, Draft, RedPacketStatus } from "./api";
+import { timelineKey } from "./timeline";
 import type { Timeline, TimelineAction } from "./timeline";
 import { statusLabels } from "./useRealtime";
+import { PacketDetails, SendPacket } from "./RedPackets";
+import { Avatar, Icon } from "./visuals";
 
 const messageTime = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit" });
 const messageDate = new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "long", day: "numeric" });
 
-export function Chat({ api, conversation, timeline, userID, status, epoch, dispatch, onBack, onFriendshipChanged, onRead }: {
+export function Chat({ api, conversation, timeline, userID, username, status, epoch, dispatch, onBack, onFriendshipChanged, onRead, onGroupDetails, packetUpdate, packetStatuses }: {
   api: ChatAPI;
   conversation: Conversation;
   timeline: Timeline;
   userID: string;
+  username: string;
   status: "connecting" | "online" | "offline";
   epoch: number;
   dispatch: Dispatch<TimelineAction>;
   onBack: () => void;
   onFriendshipChanged: () => void;
   onRead: () => void;
+  onGroupDetails: () => void;
+  packetUpdate?: { id: string };
+  packetStatuses: Record<string, RedPacketStatus>;
 }) {
-  const { id, peer_nickname: peerNickname } = conversation;
+  const { id } = conversation;
+  const key = timelineKey(conversation);
+  const joinedSeq = BigInt(conversation.joined_seq);
+  const title = conversationTitle(conversation);
   const [historyError, setHistoryError] = useState("");
   const [historyAttempt, setHistoryAttempt] = useState(0);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -28,13 +38,16 @@ export function Chat({ api, conversation, timeline, userID, status, epoch, dispa
   const [syncAttempt, setSyncAttempt] = useState(0);
   const [syncedEpoch, setSyncedEpoch] = useState(0);
   const [content, setContent] = useState("");
+  const [packetDialog, setPacketDialog] = useState<{ id: string } | "send" | null>(null);
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState("");
   const [atBottom, setAtBottom] = useState(true);
   const [pageVisible, setPageVisible] = useState(!document.hidden);
   const [readError, setReadError] = useState("");
   const [readAttempt, setReadAttempt] = useState(0);
+  const [packetArrivalID, setPacketArrivalID] = useState<string>();
   const draft = useRef<Draft | null>(null);
+  const packetArrivalTimer = useRef<number | undefined>(undefined);
   const scroll = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const prependAnchor = useRef<{ element: HTMLElement; top: number } | null>(null);
@@ -43,17 +56,21 @@ export function Chat({ api, conversation, timeline, userID, status, epoch, dispa
     (epoch !== syncedEpoch || BigInt(conversation.last_seq) > timeline.cursor);
   const readCursor = useEffectEvent(() => timeline.cursor);
 
+  useEffect(() => () => {
+    if (packetArrivalTimer.current !== undefined) window.clearTimeout(packetArrivalTimer.current);
+  }, []);
+
   useEffect(() => {
     if (initialized) return;
     const controller = new AbortController();
     setHistoryError("");
     api.messages(id, null, controller.signal).then((messages) => {
-      dispatch({ id, source: "history", messages });
+      dispatch({ key, joinedSeq, source: "history", messages });
     }).catch((error: Error) => {
       if (!controller.signal.aborted) setHistoryError(error.message);
     });
     return () => controller.abort();
-  }, [api, id, initialized, historyAttempt, dispatch]);
+  }, [api, id, key, joinedSeq, initialized, historyAttempt, dispatch]);
 
   useEffect(() => {
     if (!needsSync) return;
@@ -67,7 +84,7 @@ export function Chat({ api, conversation, timeline, userID, status, epoch, dispa
       while (!controller.signal.aborted) {
         const messages = await api.messages(id, { after_seq: after }, controller.signal);
         if (controller.signal.aborted) return;
-        if (messages.length > 0) dispatch({ id, source: "sync", messages });
+        if (messages.length > 0) dispatch({ key, joinedSeq, source: "sync", messages });
         if (messages.length < pageSize) {
           setSyncedEpoch(epoch);
           return;
@@ -80,7 +97,7 @@ export function Chat({ api, conversation, timeline, userID, status, epoch, dispa
       if (!controller.signal.aborted) setSyncError(error.message);
     });
     return () => controller.abort();
-  }, [api, id, epoch, needsSync, syncAttempt, dispatch]);
+  }, [api, id, key, joinedSeq, epoch, needsSync, syncAttempt, dispatch]);
 
   useEffect(() => {
     const onVisibilityChange = () => setPageVisible(!document.hidden);
@@ -127,7 +144,7 @@ export function Chat({ api, conversation, timeline, userID, status, epoch, dispa
           .find((element) => element.getBoundingClientRect().bottom > viewportTop);
         if (firstVisible) prependAnchor.current = { element: firstVisible, top: firstVisible.getBoundingClientRect().top };
       }
-      dispatch({ id, source: "history", messages });
+      dispatch({ key, joinedSeq, source: "history", messages });
     } catch (error) {
       setHistoryError((error as Error).message);
     } finally {
@@ -147,12 +164,12 @@ export function Chat({ api, conversation, timeline, userID, status, epoch, dispa
     try {
       const message = await api.send(id, draft.current);
       stickToBottom.current = true;
-      dispatch({ id, source: "live", messages: [message] });
+      dispatch({ key, joinedSeq, source: "live", messages: [message] });
       draft.current = null;
       setContent("");
     } catch (error) {
       setSendError((error as Error).message);
-      if (error instanceof APIError && error.code === errorCode.notFriends) onFriendshipChanged();
+      if (error instanceof APIError && (error.code === errorCode.notFriends || error.code === errorCode.notMember)) onFriendshipChanged();
     } finally {
       setSending(false);
     }
@@ -164,12 +181,11 @@ export function Chat({ api, conversation, timeline, userID, status, epoch, dispa
   return (
     <section className="chat" aria-labelledby="chat-title">
       <header className="chat-header">
-        <button type="button" className="mobile-back" onClick={onBack}>返回会话</button>
-        <span className="avatar" aria-hidden="true">{Array.from(peerNickname)[0]}</span>
-        <div>
-          <h2 id="chat-title">{peerNickname}</h2>
-          <span className="connection mobile-connection" data-status={status} role="status">{statusLabels[status]}</span>
-        </div>
+        <button type="button" className="icon-button mobile-back" aria-label="返回会话" onClick={onBack}><Icon name="back" /></button>
+        <h2 id="chat-title">{title}</h2>
+        <span className="connection chat-connection" data-status={status}>{statusLabels[status]}</span>
+        {conversation.kind === "group" && <button type="button" className="icon-button" aria-label="群详情" title="群详情"
+          onClick={onGroupDetails}><Icon name="group" /></button>}
       </header>
       <div className="chat-scroll" ref={scroll} role="region" aria-label="聊天记录" tabIndex={0} onScroll={(event) => {
         const viewport = event.currentTarget;
@@ -191,16 +207,42 @@ export function Chat({ api, conversation, timeline, userID, status, epoch, dispa
         <div role="log" aria-label="消息列表" aria-live="polite">
           {visible.map((message, index) => {
             const own = message.sender_id === userID;
+            const sender = message.sender_nickname || (own ? username : title);
             const time = new Date(message.created_at);
-            const day = messageDate.format(time);
             const previous = visible[index - 1];
+            const previousTime = previous ? new Date(previous.created_at) : null;
+            const dayChanged = !previousTime || time.toDateString() !== previousTime.toDateString();
+            const showTimestamp = dayChanged || time.getTime() - previousTime.getTime() >= 5 * 60_000;
             return <div key={message.id}>
-              {(!previous || day !== messageDate.format(new Date(previous.created_at))) && <p className="day-label">{day}</p>}
-              <article className="message" data-own={own}>
-                <span className="sr-only">{own ? "我" : peerNickname}</span>
-                <p>{message.content}</p>
-                <time dateTime={message.created_at}>{messageTime.format(time)}</time>
-              </article>
+              {showTimestamp && <time className="day-label" dateTime={message.created_at}>
+                {dayChanged && `${messageDate.format(time)} `}{messageTime.format(time)}
+              </time>}
+              {message.kind === "red_packet_claim" ? <p className="message-system" role="note">
+                {conversation.kind === "direct" ? own ? "你领取了红包" : "对方领取了你的红包" : `${sender} 领取了红包`}
+              </p> : <article className="message" data-own={own} data-packet-arrival={packetArrivalID === message.id}>
+                <Avatar name={sender} />
+                <div className="message-body">
+                  <span className={own ? "sr-only" : "message-sender"}>{own ? "我" : sender}</span>
+                  {message.kind === "red_packet" || message.red_packet_id || message.content === "[红包]" ?
+                    message.red_packet_id ? <button type="button" className={`packet-card${(packetStatuses[message.red_packet_id] ?? message.red_packet_status) === "claimed" ? " is-claimed" : ""}`}
+                      data-status={packetStatuses[message.red_packet_id] ?? message.red_packet_status ?? "open"}
+                      aria-label={own ? "查看红包领取情况" : "打开并领取积分红包"}
+                      onClick={() => setPacketDialog({ id: message.red_packet_id! })}>
+                      <span className="packet-card-main">
+                        <span className="packet-card-icon"><Icon name="envelope" /></span>
+                        <span className="packet-card-copy"><strong>积分红包</strong><span>{(packetStatuses[message.red_packet_id] ?? message.red_packet_status) === "claimed"
+                          ? "红包已领完" : own ? "查看领取情况" : "点击领取积分"}</span></span>
+                      </span>
+                      <span className="packet-card-footer"><span>回声积分</span><span className="packet-card-arrow" aria-hidden="true">›</span></span>
+                    </button> : <div className="packet-card packet-card-unavailable" role="status">
+                      <span className="packet-card-main">
+                        <span className="packet-card-icon"><Icon name="envelope" /></span>
+                      <span className="packet-card-copy"><strong>历史红包消息</strong><span>这条消息没有可打开的红包记录</span></span>
+                      </span>
+                      <span className="packet-card-footer"><span>无法领取</span></span>
+                    </div> : <p title={messageTime.format(time)}>{message.content}</p>}
+                </div>
+              </article>}
             </div>;
           })}
         </div>
@@ -213,14 +255,32 @@ export function Chat({ api, conversation, timeline, userID, status, epoch, dispa
           <p>已读状态更新失败。{readError}</p><button type="button" onClick={() => setReadAttempt((value) => value + 1)}>重试更新</button>
         </div>}
       </div>
-      {conversation.is_friend ? <form className="composer" onSubmit={send}>
-        <label htmlFor="message-content">消息</label>
-        <div className="composer-fields">
-          <textarea id="message-content" rows={2} value={content} disabled={sending} onChange={(event) => setContent(event.target.value)} />
+      {conversation.kind === "group" || conversation.is_friend ? <form className="composer" onSubmit={send}>
+        <label className="sr-only" htmlFor="message-content">消息</label>
+        <textarea id="message-content" rows={3} value={content} readOnly={sending} aria-describedby="composer-shortcuts"
+          placeholder="输入消息" onChange={(event) => setContent(event.target.value)} onKeyDown={(event) => {
+            // 输入法确认候选词时，Enter 交给输入法处理。
+            if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing || event.keyCode === 229) return;
+            event.preventDefault();
+            if (!event.repeat) event.currentTarget.form?.requestSubmit();
+          }} />
+        <div className="composer-toolbar">
+          <p id="composer-shortcuts" className="hint"><Icon name="keyboard" /><span>Enter 发送 · Shift + Enter 换行</span></p>
+          <button type="button" className="packet-send" onClick={() => setPacketDialog("send")}>发红包</button>
           <button type="submit" className="primary" disabled={sending || !content.trim()}>{sending ? "正在发送…" : "发送"}</button>
         </div>
         {sendError && <p className="error" role="alert">{sendError}</p>}
-      </form> : <p className="composer" role="status">聊天记录仍可查看。成为好友后可以发送新消息。</p>}
+      </form> : <p className="composer composer-locked" role="status">聊天记录仍可查看。成为好友后可以发送新消息。</p>}
+      {packetDialog === "send" && <SendPacket api={api} conversation={conversation} onClose={() => setPacketDialog(null)} onSent={(message) => {
+        stickToBottom.current = true;
+        dispatch({ key, joinedSeq, source: "live", messages: [message] });
+        setPacketArrivalID(message.id);
+        if (packetArrivalTimer.current !== undefined) window.clearTimeout(packetArrivalTimer.current);
+        packetArrivalTimer.current = window.setTimeout(() => setPacketArrivalID(undefined), 760);
+        setPacketDialog(null);
+      }} />}
+      {packetDialog && packetDialog !== "send" && <PacketDetails api={api} id={packetDialog.id} epoch={epoch}
+        update={packetUpdate?.id === packetDialog.id ? packetUpdate : undefined} onClose={() => setPacketDialog(null)} />}
     </section>
   );
 }

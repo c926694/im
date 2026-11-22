@@ -7,6 +7,8 @@ import (
 
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
+
+	"github.com/c926694/im/backend/internal/points"
 )
 
 var (
@@ -73,7 +75,12 @@ func (s *Store) Register(ctx context.Context, username, password, nickname strin
 		return 0, err
 	}
 	// 让唯一索引判定用户名冲突，避免并发注册时先查再写。
-	result, err := s.db.ExecContext(ctx, `INSERT INTO users (username, password_hash, nickname) VALUES (?, ?, ?)`, username, hash, nickname)
+	tx, err := s.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `INSERT INTO users (username, password_hash, nickname) VALUES (?, ?, ?)`, username, hash, nickname)
 	var dbErr *mysqldriver.MySQLError
 	if errors.As(err, &dbErr) && dbErr.Number == 1062 {
 		return 0, ErrUsernameTaken
@@ -81,7 +88,15 @@ func (s *Store) Register(ctx context.Context, username, password, nickname strin
 	if err != nil {
 		return 0, err
 	}
-	return result.LastInsertId()
+	id, err := result.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	// 注册成功时账户和发放流水必须同时存在。
+	if err := points.OpenAccount(ctx, tx, id); err != nil {
+		return 0, err
+	}
+	return id, tx.Commit()
 }
 
 func (s *Store) Login(ctx context.Context, username, password string) (int64, error) {

@@ -15,6 +15,7 @@ func Open(dsn string) (*sqlx.DB, error) {
 	}
 	config.ParseTime = true
 	config.Loc = time.UTC
+	config.MultiStatements = true
 	if config.Params == nil {
 		config.Params = make(map[string]string)
 	}
