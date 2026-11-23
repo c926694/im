@@ -35,14 +35,15 @@ func (s *Store) FindIDByUsername(ctx context.Context, username string) (int64, e
 }
 
 type Profile struct {
-	ID       int64  `db:"id" json:"id,string"`
-	Username string `db:"username" json:"username"`
-	Nickname string `db:"nickname" json:"nickname"`
+	ID        int64  `db:"id" json:"id,string"`
+	Username  string `db:"username" json:"username"`
+	Nickname  string `db:"nickname" json:"nickname"`
+	AvatarURL string `db:"avatar_url" json:"avatar_url"`
 }
 
 func (s *Store) FindProfileByUsername(ctx context.Context, username string) (Profile, error) {
 	var profile Profile
-	err := s.db.GetContext(ctx, &profile, `SELECT id, username, nickname FROM users WHERE username = ?`, username)
+	err := s.db.GetContext(ctx, &profile, `SELECT id, username, nickname, CONCAT('/avatars/', COALESCE(NULLIF(avatar_name, ''), 'default.webp')) AS avatar_url FROM users WHERE username = ?`, username)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Profile{}, ErrUserNotFound
 	}
@@ -54,7 +55,7 @@ func (s *Store) ProfilesByIDs(ctx context.Context, ids []int64) (map[int64]Profi
 	if len(ids) == 0 {
 		return byID, nil
 	}
-	query, args, err := sqlx.In(`SELECT id, username, nickname FROM users WHERE id IN (?)`, ids)
+	query, args, err := sqlx.In(`SELECT id, username, nickname, CONCAT('/avatars/', COALESCE(NULLIF(avatar_name, ''), 'default.webp')) AS avatar_url FROM users WHERE id IN (?)`, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -66,6 +67,11 @@ func (s *Store) ProfilesByIDs(ctx context.Context, ids []int64) (map[int64]Profi
 		byID[profile.ID] = profile
 	}
 	return byID, nil
+}
+
+func (s *Store) SetAvatar(ctx context.Context, id int64, name string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE users SET avatar_name = ? WHERE id = ?`, name, id)
+	return err
 }
 
 func (s *Store) Register(ctx context.Context, username, password, nickname string) (int64, error) {

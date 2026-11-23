@@ -26,6 +26,7 @@ export type TimelineAction = { source: "keep"; keys: string[] } | {
 export function timelinesReducer(timelines: Record<string, Timeline>, action: TimelineAction) {
   if (action.source === "keep") {
     const keys = new Set(action.keys);
+    if (Object.keys(timelines).every((key) => keys.has(key))) return timelines;
     return Object.fromEntries(Object.entries(timelines).filter(([key]) => keys.has(key)));
   }
   const { key, joinedSeq } = action;

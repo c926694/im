@@ -7,6 +7,7 @@ RUN CGO_ENABLED=0 go build -trimpath -o /out/im ./cmd/im
 
 FROM alpine:3.23
 COPY --from=build /out/im /usr/local/bin/im
+RUN mkdir -p /var/lib/im/avatars /var/lib/im/chat-images && chown 65534:65534 /var/lib/im/avatars /var/lib/im/chat-images
 USER 65534:65534
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/im"]

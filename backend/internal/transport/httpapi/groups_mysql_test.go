@@ -26,7 +26,9 @@ func TestGroupChatMySQL(t *testing.T) {
 	}
 	t.Cleanup(func() { db.Close() })
 	hub := realtime.NewHub()
-	server := testServer(t, NewRouter(user.NewStore(db), chat.NewService(chat.NewStore(db)), friendship.NewService(friendship.NewStore(db)), hub, testSecret, nil, nil), hub)
+	chats := chat.NewService(chat.NewStore(db))
+	startNotifications(t, db, chats, hub)
+	server := testServer(t, NewRouter(user.NewStore(db), chats, friendship.NewService(friendship.NewStore(db)), hub, testSecret, nil, nil), hub)
 	owner := registerAndLogin(t, server, "owner", "")
 	admin := registerAndLogin(t, server, "admin", "")
 	member := registerAndLogin(t, server, "member", "")
@@ -76,6 +78,7 @@ func TestGroupChatMySQL(t *testing.T) {
 	// 断线期间发送的消息通过 HTTP 增量查询补齐。
 	conn.Close()
 	second := send(t, server, messages, owner.Token, 2)
+	waitMessagePublished(t, db, second.ID)
 	_, events = openDevice(t, server, admin.Token)
 	var history []messageResponse
 	request(t, server, http.MethodGet, messages+"?after_seq=1", admin.Token, nil, http.StatusOK, &history)

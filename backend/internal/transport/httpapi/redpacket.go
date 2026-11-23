@@ -91,7 +91,7 @@ func (h *handler) sendPacket(c *gin.Context) {
 		internalError(c, errors.New("red packet status is missing"))
 		return
 	}
-	messageResponse := realtime.NewMessageCreated(message, profiles[userID].Nickname)
+	messageResponse := realtime.NewMessageCreated(message, profiles[userID].Nickname, profiles[userID].AvatarURL)
 	messageResponse.RedPacketStatus = string(status)
 	respondSuccess(c, gin.H{"red_packet_id": strconv.FormatInt(*message.RedPacketID, 10), "message": messageResponse})
 }

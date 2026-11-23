@@ -27,7 +27,8 @@ type Store interface {
 	AreFriends(ctx context.Context, userID, peerID int64) (bool, error)
 	AreFriendsTx(ctx context.Context, tx *sqlx.Tx, userID, peerID int64) (bool, error)
 	UpsertDirect(ctx context.Context, low, high int64) (int64, error)
-	ListConversations(ctx context.Context, userID int64) ([]ConversationSummary, error)
+	ListConversations(ctx context.Context, userID int64, ids ...int64) ([]ConversationSummary, error)
+	ListConversationVersions(ctx context.Context, userID int64) ([]ConversationSummary, error)
 	Membership(ctx context.Context, tx *sqlx.Tx, conversationID, userID int64) (Member, error)
 	AdvanceRead(ctx context.Context, userID, conversationID, seq int64) error
 	BeginTx(ctx context.Context) (*sqlx.Tx, error)
@@ -128,7 +129,15 @@ func (s *mysqlStore) UpsertDirect(ctx context.Context, low, high int64) (int64, 
 }
 
 // ListConversations 查询用户的会话摘要和个人已读游标。
-func (s *mysqlStore) ListConversations(ctx context.Context, userID int64) ([]ConversationSummary, error) {
+func (s *mysqlStore) ListConversations(ctx context.Context, userID int64, ids ...int64) ([]ConversationSummary, error) {
+	return s.listConversations(ctx, userID, true, ids)
+}
+
+func (s *mysqlStore) ListConversationVersions(ctx context.Context, userID int64) ([]ConversationSummary, error) {
+	return s.listConversations(ctx, userID, false, nil)
+}
+
+func (s *mysqlStore) listConversations(ctx context.Context, userID int64, details bool, filter []int64) ([]ConversationSummary, error) {
 	// 会话摘要的成员资格、正文和未读数读取同一个快照。
 	tx, err := s.BeginSnapshot(ctx)
 	if err != nil {
@@ -141,8 +150,15 @@ func (s *mysqlStore) ListConversations(ctx context.Context, userID int64) ([]Con
 		LastReadSeq    int64 `db:"last_read_seq"`
 		JoinedSeq      int64 `db:"joined_seq"`
 	}
-	if err := tx.SelectContext(ctx, &memberships, `
-		SELECT conversation_id, last_read_seq, joined_seq FROM conversation_members WHERE user_id = ? AND left_at IS NULL`, userID); err != nil {
+	query := `SELECT conversation_id, last_read_seq, joined_seq FROM conversation_members WHERE user_id = ? AND left_at IS NULL`
+	args := []any{userID}
+	if len(filter) > 0 {
+		query, args, err = sqlx.In(query+` AND conversation_id IN (?)`, userID, filter)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.SelectContext(ctx, &memberships, query, args...); err != nil {
 		return nil, err
 	}
 	conversations := []ConversationSummary{}
@@ -158,7 +174,7 @@ func (s *mysqlStore) ListConversations(ctx context.Context, userID int64) ([]Con
 		readSeqs[member.ConversationID] = member.LastReadSeq
 		joinedSeqs[member.ConversationID] = member.JoinedSeq
 	}
-	query, args, err := sqlx.In(`
+	query, args, err = sqlx.In(`
 		SELECT id, COALESCE(IF(direct_user_low_id = ?, direct_user_high_id, direct_user_low_id), 0) AS peer_user_id,
 		       kind, COALESCE(group_name, '') AS group_name, last_seq, last_activity_at
 		FROM conversations WHERE id IN (?) AND closed_at IS NULL ORDER BY last_activity_at DESC, id DESC`, userID, ids)
@@ -171,6 +187,9 @@ func (s *mysqlStore) ListConversations(ctx context.Context, userID int64) ([]Con
 	for i := range conversations {
 		conversations[i].LastReadSeq = readSeqs[conversations[i].ID]
 		conversations[i].JoinedSeq = joinedSeqs[conversations[i].ID]
+	}
+	if !details {
+		return conversations, nil
 	}
 	if err := s.fillLastMessages(ctx, tx, conversations); err != nil {
 		return nil, err
@@ -284,33 +303,42 @@ func NewMessageDraft(clientMsgID, content string) (MessageDraft, error) {
 		return MessageDraft{}, err
 	}
 
-	if !utf8.ValidString(content) || strings.TrimSpace(content) == "" || utf8.RuneCountInString(content) > 2000 {
-		return MessageDraft{}, ErrInvalidContent
+	if err := ValidateMessageContent(content); err != nil {
+		return MessageDraft{}, err
 	}
 	return MessageDraft{clientMsgID: clientMsgID, content: content}, nil
+}
+
+func ValidateMessageContent(content string) error {
+	if !utf8.ValidString(content) || strings.TrimSpace(content) == "" || utf8.RuneCountInString(content) > 2000 {
+		return ErrInvalidContent
+	}
+	return nil
 }
 
 type MessageKind string
 
 const (
+	ImageMessage          MessageKind = "image"
 	TextMessage           MessageKind = "text"
 	RedPacketMessage      MessageKind = "red_packet"
 	RedPacketClaimMessage MessageKind = "red_packet_claim"
 )
 
 type Message struct {
-	Kind           MessageKind `db:"kind"`
-	RedPacketID    *int64      `db:"red_packet_id"`
-	ID             int64       `db:"id"`
-	ConversationID int64       `db:"conversation_id"`
-	SenderID       int64       `db:"sender_id"`
-	ClientMsgID    string      `db:"client_msg_id"`
-	Seq            int64       `db:"seq"`
-	Content        string      `db:"content"`
-	CreatedAt      time.Time   `db:"created_at"`
+	ImagePath      sql.NullString `db:"image_path"`
+	Kind           MessageKind    `db:"kind"`
+	RedPacketID    *int64         `db:"red_packet_id"`
+	ID             int64          `db:"id"`
+	ConversationID int64          `db:"conversation_id"`
+	SenderID       int64          `db:"sender_id"`
+	ClientMsgID    string         `db:"client_msg_id"`
+	Seq            int64          `db:"seq"`
+	Content        string         `db:"content"`
+	CreatedAt      time.Time      `db:"created_at"`
 }
 
-const selectMessage = `SELECT id, conversation_id, sender_id, client_msg_id, seq, content, created_at, kind, red_packet_id FROM messages`
+const selectMessage = `SELECT id, conversation_id, sender_id, client_msg_id, seq, content, created_at, kind, red_packet_id, image_path FROM messages`
 
 type SendResult struct {
 	Message    Message
@@ -339,8 +367,8 @@ func (s *mysqlStore) FindSentMessage(ctx context.Context, tx *sqlx.Tx, conversat
 // InsertMessage 将新消息写入消息表并返回数据库消息 ID。
 func (s *mysqlStore) InsertMessage(ctx context.Context, tx *sqlx.Tx, message Message) (int64, error) {
 	result, err := tx.ExecContext(ctx, `
-		INSERT INTO messages (conversation_id, sender_id, client_msg_id, seq, content, created_at, kind, red_packet_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, message.ConversationID, message.SenderID, message.ClientMsgID, message.Seq, message.Content, message.CreatedAt, message.Kind, message.RedPacketID)
+		INSERT INTO messages (conversation_id, sender_id, client_msg_id, seq, content, created_at, kind, red_packet_id, image_path)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, message.ConversationID, message.SenderID, message.ClientMsgID, message.Seq, message.Content, message.CreatedAt, message.Kind, message.RedPacketID, message.ImagePath)
 	if err != nil {
 		return 0, err
 	}

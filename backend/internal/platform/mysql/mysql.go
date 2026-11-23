@@ -14,6 +14,7 @@ func Open(dsn string) (*sqlx.DB, error) {
 		return nil, err
 	}
 	config.ParseTime = true
+	config.Timeout = 3 * time.Second
 	config.Loc = time.UTC
 	config.MultiStatements = true
 	if config.Params == nil {
@@ -24,5 +25,9 @@ func Open(dsn string) (*sqlx.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	return sqlx.NewDb(sql.OpenDB(connector), "mysql"), nil
+	db := sqlx.NewDb(sql.OpenDB(connector), "mysql")
+	db.SetMaxOpenConns(32)
+	db.SetMaxIdleConns(16)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+	return db, nil
 }

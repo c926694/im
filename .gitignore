@@ -6,6 +6,8 @@
 
 # Go build and local workspace artifacts
 /backend/bin/
+/backend/avatars/
+/backend/chat-images/
 *.test
 coverage.out
 go.work

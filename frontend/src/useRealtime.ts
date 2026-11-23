@@ -3,16 +3,19 @@ import type { ChatAPI, Message, RedPacketStatus } from "./api";
 
 export const statusLabels = { connecting: "正在连接", online: "已连接", offline: "连接已断开" };
 
-type Frame = { type: "message.created"; data: Message } |
+type Frame = { type: "presence.updated" } | { type: "message.created"; data: Message } |
+  { type: "conversation.read"; data: { conversation_id: string; seq: string } } |
   { type: "conversation.updated"; data: { conversation_id: string } } |
   { type: "red_packet.updated"; data: { red_packet_id: string; status: RedPacketStatus } };
 
 export function useRealtime(api: ChatAPI, onMessage: (message: Message) => void, onConversationUpdated: (id: string) => void,
-  onPacketUpdated: (id: string, status: RedPacketStatus) => void) {
+  onPacketUpdated: (id: string, status: RedPacketStatus) => void, onPresence: () => void, onRead: (id: string, seq: string) => void) {
   const [status, setStatus] = useState<"connecting" | "online" | "offline">("connecting");
   const [epoch, setEpoch] = useState(0);
   const receive = useEffectEvent(onMessage);
   const refresh = useEffectEvent(onConversationUpdated);
+  const receiveRead = useEffectEvent(onRead);
+  const refreshPresence = useEffectEvent(onPresence);
   const refreshPacket = useEffectEvent(onPacketUpdated);
 
   useEffect(() => {
@@ -26,7 +29,7 @@ export function useRealtime(api: ChatAPI, onMessage: (message: Message) => void,
       if (controller.signal.aborted) return;
       setStatus("offline");
       if (navigator.onLine) {
-        timer = window.setTimeout(() => void connect(), retryDelay);
+        timer = window.setTimeout(() => void connect(), retryDelay / 2 + Math.random() * retryDelay / 2);
         retryDelay = Math.min(retryDelay * 2, 10000);
       }
     }
@@ -51,8 +54,10 @@ export function useRealtime(api: ChatAPI, onMessage: (message: Message) => void,
         };
         socket.onmessage = (event: MessageEvent<string>) => {
           const frame = JSON.parse(event.data) as Frame;
+          if (frame.type === "presence.updated") refreshPresence();
           if (frame.type === "message.created") receive(frame.data);
           if (frame.type === "red_packet.updated") refreshPacket(frame.data.red_packet_id, frame.data.status);
+          if (frame.type === "conversation.read") receiveRead(frame.data.conversation_id, frame.data.seq);
           if (frame.type === "conversation.updated") refresh(frame.data.conversation_id);
         };
         socket.onclose = () => {

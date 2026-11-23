@@ -16,7 +16,7 @@ type ConversationBase = {
 };
 
 export type Conversation = ConversationBase & (
-  { kind: "direct"; peer_nickname: string; is_friend: boolean } |
+  { kind: "direct"; peer_nickname: string; peer_avatar_url?: string; peer_online?: boolean; is_friend: boolean } |
   { kind: "group"; group_name: string }
 );
 
@@ -24,20 +24,21 @@ export function conversationTitle(conversation: Conversation) {
   return conversation.kind === "group" ? conversation.group_name : conversation.peer_nickname;
 }
 
-export type Profile = { id: string; username: string; nickname: string };
+export type Profile = { id: string; username: string; nickname: string; avatar_url?: string; online?: boolean };
 export type FriendRequest = { id: string; peer: Profile; direction: "incoming" | "outgoing" };
 export type GroupRole = "owner" | "admin" | "member";
 export type GroupMember = Profile & { role: GroupRole };
 export type Group = { id: string; name: string; members: GroupMember[] };
 
 export type Message = {
-  kind: "text" | "red_packet" | "red_packet_claim";
+  kind: "image" | "text" | "red_packet" | "red_packet_claim";
   red_packet_id?: string;
   red_packet_status?: RedPacketStatus;
   id: string;
   conversation_id: string;
   sender_id: string;
   sender_nickname: string;
+  sender_avatar_url?: string;
   client_msg_id: string;
   seq: string;
   content: string;
@@ -94,7 +95,7 @@ export class APIError extends Error {
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers);
-  if (options.body) headers.set("Content-Type", "application/json");
+  if (options.body && !(options.body instanceof FormData)) headers.set("Content-Type", "application/json");
 
   let response: Response;
   try {
@@ -146,6 +147,12 @@ export function chatAPI(session: Session, onExpired: () => void) {
   }
 
   return {
+    me: (signal: AbortSignal) => authorized<Profile>("/me", { signal }),
+    uploadAvatar: (file: File) => {
+      const body = new FormData();
+      body.set("avatar", file);
+      return authorized<{ avatar_url: string }>("/me/avatar", { method: "PATCH", body });
+    },
     lookupUser: (username: string) => authorized<Profile>(`/users/by-username?${new URLSearchParams({ username })}`),
     friends: (signal: AbortSignal) => authorized<Profile[]>("/friends", { signal }),
     friendRequests: (signal: AbortSignal) => authorized<FriendRequest[]>("/friend-requests", { signal }),
@@ -156,7 +163,10 @@ export function chatAPI(session: Session, onExpired: () => void) {
       method: "PATCH", body: JSON.stringify({ status }),
     }),
     removeFriend: (id: string) => authorized<{ status: string }>(`/friends/${id}`, { method: "DELETE" }),
-    conversations: (signal?: AbortSignal) => authorized<Conversation[]>("/conversations", { signal }),
+    conversations: (signal?: AbortSignal, ids?: string[]) =>
+      authorized<Conversation[]>(`/conversations${ids ? "?" + new URLSearchParams({ ids: ids.join(",") }) : ""}`, { signal }),
+    conversationVersions: (signal: AbortSignal) =>
+      authorized<Pick<Conversation, "id" | "joined_seq" | "last_seq" | "last_read_seq">[]>("/conversations/versions", { signal }),
     direct: (peerUsername: string) => authorized<{ id: string }>("/conversations/direct", {
       method: "POST",
       body: JSON.stringify({ peer_username: peerUsername }),
@@ -180,9 +190,28 @@ export function chatAPI(session: Session, onExpired: () => void) {
     }),
     leaveGroup: (id: string) => authorized<{ id: string }>(`/groups/${id}/leave`, { method: "POST" }),
     ticket: (signal: AbortSignal) => authorized<{ ticket: string }>("/ws/tickets", { method: "POST", signal }),
+    syncState: (id: string, signal: AbortSignal) => authorized<{ last_seq: string }>(`/conversations/${id}/sync-state`, { signal }),
     messages: (id: string, cursor: { before_seq: string } | { after_seq: string } | null, signal?: AbortSignal) => {
       const params = new URLSearchParams({ limit: String(pageSize), ...cursor });
       return authorized<Message[]>(`/conversations/${id}/messages?${params}`, { signal });
+    },
+    sendImage: (id: string, file: File, clientID: string, content: string) => {
+      const body = new FormData();
+      body.set("image", file);
+      body.set("client_msg_id", clientID);
+      body.set("content", content);
+      return authorized<Message>(`/conversations/${id}/messages`, { method: "POST", body });
+    },
+    image: async (id: string, signal: AbortSignal) => {
+      const response = await fetch(`/api/v1/messages/${id}/image`, {
+        signal, headers: { Authorization: `Bearer ${session.accessToken}` },
+      });
+      const type = response.headers.get("content-type");
+      if (type === "image/jpeg" || type === "image/png" || type === "image/webp") return response.blob();
+      if (!type?.includes("application/json")) throw new Error("无法加载图片");
+      const body = await response.json() as APIResponse<null>;
+      if (body.code === errorCode.invalidToken) onExpired();
+      throw new APIError(body.code, body.msg);
     },
     send: (id: string, draft: Draft) => authorized<Message>(`/conversations/${id}/messages`, {
       method: "POST",

@@ -188,7 +188,11 @@ label { display: block; font-weight: 600; }
 .message-body { display: grid; justify-items: start; gap: 4px; min-width: 0; max-width: min(77%, 620px); }
 .message[data-own="true"] .message-body { justify-items: end; }
 .message-sender { color: var(--muted); font-size: .75rem; overflow-wrap: anywhere; }
-.message-system { width: fit-content; max-width: min(88%, 560px); margin: 16px auto; padding: 5px 12px; color: #707578; background: #e9eaeb; border-radius: 999px; text-align: center; font-size: .78rem; overflow-wrap: anywhere; }
+.message-system { max-width: min(88%, 560px); margin: 12px auto 18px; color: #a52b23; text-align: center; font-size: .75rem; overflow-wrap: anywhere; }
+.avatar img { width: 100%; height: 100%; border-radius: inherit; object-fit: cover; }
+.presence { font-size: .75rem; font-weight: 400; color: var(--muted); }
+.presence[data-online="true"] { color: #276447; }
+.avatar-upload { display: grid; gap: 5px; padding: 0 14px 14px; }
 .message-body p { position: relative; min-width: 0; max-width: 100%; padding: 8px 12px; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--bubble); border-radius: 7px; }
 .message-body p::before { position: absolute; top: 13px; left: -4px; width: 8px; height: 8px; transform: rotate(45deg); background: var(--bubble); content: ""; }
 .message[data-own="true"] p::before { right: -4px; left: auto; }
@@ -198,7 +202,15 @@ label { display: block; font-weight: 600; }
 .composer:focus-within { border-color: #99b5a5; }
 .composer textarea { height: clamp(62px, 15dvh, 140px); padding: 5px; border: 0; outline: 0; resize: none; background: transparent; }
 .composer-toolbar, .composer-toolbar .hint { display: flex; align-items: center; gap: 7px; }
-.composer-toolbar { justify-content: space-between; }
+.composer-toolbar { justify-content: space-between; flex-wrap: wrap; }
+.chat-image-message { display: grid; justify-items: start; gap: 6px; min-width: 0; max-width: 100%; }
+.message[data-own="true"] .chat-image-message { justify-items: end; }
+.chat-image, .chat-image:hover:not(:disabled) { display: block; padding: 0; border: 0; overflow: hidden; max-width: min(100%, 300px); background: transparent; }
+.chat-image img { display: block; width: auto; height: auto; max-width: 100%; max-height: 220px; object-fit: contain; }
+.chat-image-dialog { width: min(960px, calc(100% - 24px)); }
+.chat-image-dialog img { display: block; margin: auto; max-width: 100%; max-height: 72dvh; object-fit: contain; }
+.composer-image { display: flex; align-items: center; gap: 8px; }
+.composer-image img { width: 72px; height: 72px; object-fit: contain; }
 .composer-toolbar .hint { color: var(--muted); font-size: .75rem; }
 .composer-toolbar svg { width: 19px; height: 19px; flex: none; }
 .composer button { flex: none; min-width: 76px; min-height: 38px; padding-block: 5px; }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"strconv"
 	"time"
@@ -23,6 +24,32 @@ const topic = "im_redpacket_events"
 type Client struct {
 	producer mq.Producer
 	consumer mq.PushConsumer
+}
+
+// Run 在后台建立通知连接；Broker 未启动时，HTTP 服务和数据库写入仍可运行。
+func Run(ctx context.Context, address string, store *outbox.Store, notify func(context.Context, outbox.Event) error) {
+	for delay := time.Second; ctx.Err() == nil; delay = min(delay*2, 15*time.Second) {
+		client, err := Open(ctx, address, notify)
+		if err == nil {
+			slog.Info("RocketMQ notification worker started")
+			store.Run(ctx, client, 8)
+			if err := client.Close(); err != nil {
+				slog.Warn("close RocketMQ notification worker", "error", err)
+			}
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		slog.Warn("RocketMQ notification worker unavailable", "error", err, "retry_in", delay)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
 }
 
 // Open 连接已有 Topic。Go 客户端要求 NameServer 使用 IP 地址。

@@ -3,9 +3,10 @@ import type { FormEvent } from "react";
 import type { ChatAPI, FriendRequest, Profile } from "./api";
 import { Avatar } from "./visuals";
 
-export function Friends({ api, userID, view, onOpen, onChanged }: {
+export function Friends({ api, userID, view, presenceRevision, onOpen, onChanged }: {
   api: ChatAPI;
   userID: string;
+  presenceRevision: string;
   view: "friends" | "requests";
   onOpen: (username: string) => Promise<void>;
   onChanged: () => void;
@@ -33,7 +34,7 @@ export function Friends({ api, userID, view, onOpen, onChanged }: {
       if (!controller.signal.aborted) setLoading(false);
     });
     return () => controller.abort();
-  }, [api, view, revision]);
+  }, [api, view, revision, presenceRevision]);
 
   async function run(action: () => Promise<void>) {
     setBusy(true);
@@ -96,6 +97,7 @@ export function Friends({ api, userID, view, onOpen, onChanged }: {
         {!loading && !error && friends.length === 0 && <p className="list-note">暂无好友。</p>}
         <ul>{friends.map((friend) => <li key={friend.id} className="friend-row">
           <FriendName profile={friend} />
+          <span className="presence" data-online={friend.online}>{friend.online ? "在线" : "离线"}</span>
           <div className="friend-actions">
             {removeID === friend.id ? <>
               <button type="button" disabled={busy} onClick={() => setRemoveID(null)}>取消</button>
@@ -134,7 +136,7 @@ export function Friends({ api, userID, view, onOpen, onChanged }: {
 }
 
 function FriendName({ profile }: { profile: Profile }) {
-  return <span className="friend-identity"><Avatar name={profile.nickname} />
+  return <span className="friend-identity"><Avatar name={profile.nickname} src={profile.avatar_url} />
     <span className="conversation-label"><strong>{profile.nickname}</strong><span>@{profile.username}</span></span>
   </span>;
 }

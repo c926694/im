@@ -2,6 +2,7 @@ name: im-dev
 
 services:
   frontend:
+    restart: unless-stopped
     build:
       context: ..
       dockerfile: docker/frontend.Dockerfile
@@ -18,29 +19,34 @@ services:
       retries: 5
 
   backend:
+    restart: unless-stopped
     build:
       context: ..
       dockerfile: docker/backend.Dockerfile
     environment:
       GIN_MODE: release
+      IM_AVATAR_DIR: /var/lib/im/avatars
+      IM_CHAT_IMAGE_DIR: /var/lib/im/chat-images
       IM_HTTP_ADDR: 0.0.0.0:8080
       IM_JWT_SECRET: ${IM_JWT_SECRET:?Set IM_JWT_SECRET in docker/.env}
       IM_ROCKETMQ_NAMESRV: rocketmq-namesrv:9876
       IM_MYSQL_DSN: ${IM_MYSQL_USER:-im_dev}:${IM_MYSQL_PASSWORD:?Set IM_MYSQL_PASSWORD in docker/.env}@tcp(mysql:3306)/${IM_MYSQL_DATABASE:-im}
+    volumes:
+      - avatar-data:/var/lib/im/avatars
+      - chat-image-data:/var/lib/im/chat-images
     ports:
       - "127.0.0.1:${IM_BACKEND_PORT:-8080}:8080"
     depends_on:
       mysql:
         condition: service_healthy
-      rocketmq-topic:
-        condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/readyz"]
       interval: 5s
       timeout: 3s
       retries: 5
 
   mysql:
+    restart: unless-stopped
     image: mysql:8.4
     environment:
       MYSQL_ROOT_PASSWORD: ${IM_MYSQL_ROOT_PASSWORD:?Set IM_MYSQL_ROOT_PASSWORD in docker/.env}
@@ -59,6 +65,7 @@ services:
       start_period: 20s
 
   redis:
+    restart: unless-stopped
     image: redis:7.4-alpine
     ports:
       - "127.0.0.1:${IM_REDIS_PORT:-6379}:6379"
@@ -71,6 +78,7 @@ services:
       retries: 5
 
   rocketmq-namesrv:
+    restart: unless-stopped
     image: apache/rocketmq:5.3.4
     command: ["nameserver"]
     environment:
@@ -82,6 +90,7 @@ services:
       retries: 12
 
   rocketmq-broker:
+    restart: unless-stopped
     image: im-rocketmq-broker:5.3.4
     build:
       context: ..
@@ -111,6 +120,8 @@ services:
         condition: service_healthy
 
 volumes:
+  avatar-data:
+  chat-image-data:
   rocketmq-data:
   mysql-data:
   redis-data:

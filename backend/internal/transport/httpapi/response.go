@@ -37,6 +37,9 @@ type responseDefinition struct {
 }
 
 var responseDefinitions = map[string]responseDefinition{
+	"image_busy":                  {code: 50001, msg: "图片发送繁忙，请稍后重试"},
+	"invalid_chat_image":          {code: codeInvalidRequest, msg: "请选择不超过 5 MiB 的 JPEG、PNG 或 WebP 图片，宽高均不得超过 4096 像素"},
+	"invalid_avatar":              {code: codeInvalidRequest, msg: "请选择不超过 2 MiB 的 JPEG、PNG 或 WebP 图片，宽高均不得超过 4096 像素"},
 	"invalid_request":             {code: codeInvalidRequest, msg: "请求参数错误"},
 	"invalid_registration":        {code: codeInvalidRequest, msg: "注册参数错误"},
 	"invalid_login":               {code: codeInvalidRequest, msg: "登录参数错误"},

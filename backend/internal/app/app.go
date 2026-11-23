@@ -12,6 +12,7 @@ import (
 
 	"github.com/c926694/im/backend/internal/chat"
 	"github.com/c926694/im/backend/internal/friendship"
+	"github.com/c926694/im/backend/internal/notify"
 	"github.com/c926694/im/backend/internal/outbox"
 	"github.com/c926694/im/backend/internal/platform/mysql"
 	"github.com/c926694/im/backend/internal/platform/rocketmq"
@@ -50,6 +51,10 @@ func Run(ctx context.Context) error {
 		return fmt.Errorf("migrate MySQL schema: %w", err)
 	}
 
+	if err := chat.MigrateImageFiles(ctx, db, chat.ImageDirectory()); err != nil {
+		return fmt.Errorf("migrate chat images: %w", err)
+	}
+
 	// HTTP 发消息和 WebSocket 握手必须共用同一个 Hub。
 	hub := realtime.NewHub()
 	defer hub.Close()
@@ -62,25 +67,52 @@ func Run(ctx context.Context) error {
 	}
 	workerCtx, stopWorkers := context.WithCancel(ctx)
 	defer stopWorkers()
-	notifier := packetNotifier{chat: chats, redPackets: packets, users: users, hub: hub}
-	events, err := rocketmq.Open(workerCtx, mqAddr, notifier.notify)
-	if err != nil {
-		return fmt.Errorf("start RocketMQ client: %w", err)
-	}
+	notifier := notify.New(chats, packets, users, hub)
+	events := outbox.NewStore(db)
+	chats.SetMessageCommittedListener(events.Wake)
 	var workers sync.WaitGroup
 	workers.Add(2)
-	go func() { defer workers.Done(); outbox.NewStore(db).Run(workerCtx, events) }()
+	go func() { defer workers.Done(); rocketmq.Run(workerCtx, mqAddr, events, notifier.Deliver) }()
 	go func() { defer workers.Done(); packets.RunRefunds(workerCtx) }()
 	defer func() {
 		stopWorkers()
 		workers.Wait()
-		if err := events.Close(); err != nil {
-			slog.Error("close RocketMQ client", "error", err)
-		}
 	}()
+	friends := friendship.NewService(friendship.NewStore(db))
+	hub.SetPresenceListener(func(id int64) {
+		queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		entries, err := friends.List(queryCtx, id, friendship.Accepted)
+		if err != nil {
+			if queryCtx.Err() == nil {
+				slog.Warn("query presence audience", "error", err)
+			}
+			return
+		}
+		ids := make([]int64, 0, len(entries))
+		for _, entry := range entries {
+			ids = append(ids, entry.PeerID)
+		}
+		// 通知只触发重新查询，连接快速切换时客户端仍读取当前状态。
+		if err := hub.PushPresence(ids); err != nil {
+			slog.Warn("push presence", "error", err)
+		}
+	})
+	router := http.NewServeMux()
+	router.Handle("/", httpapi.NewRouter(users, chats, friends, hub, []byte(secret), points.NewStore(db), packets))
+	router.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		probeCtx, cancel := context.WithTimeout(r.Context(), time.Second)
+		defer cancel()
+		if err := db.PingContext(probeCtx); err != nil {
+			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           httpapi.NewRouter(users, chats, friendship.NewService(friendship.NewStore(db)), hub, []byte(secret), points.NewStore(db), packets),
+		Handler:           router,
+		ReadTimeout:       15 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	serveErr := make(chan error, 1)

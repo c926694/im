@@ -96,7 +96,9 @@ func TestDirectChatMySQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	hub := realtime.NewHub()
-	server := testServer(t, NewRouter(user.NewStore(db), chat.NewService(chat.NewStore(db)), friendship.NewService(friendship.NewStore(db)), hub, testSecret, nil, nil), hub)
+	chats := chat.NewService(chat.NewStore(db))
+	startNotifications(t, db, chats, hub)
+	server := testServer(t, NewRouter(user.NewStore(db), chats, friendship.NewService(friendship.NewStore(db)), hub, testSecret, nil, nil), hub)
 	alice := registerAndLogin(t, server, "alice", "")
 	bob := registerAndLogin(t, server, "bob", "?")
 	outsider := registerAndLogin(t, server, "outsider", "  "+strings.Repeat("你好!", 25)+"\n\t ")
@@ -154,12 +156,18 @@ func TestDirectChatMySQL(t *testing.T) {
 	if repeated != first {
 		t.Fatalf("retry returned %+v, want %+v", repeated, first)
 	}
+	waitMessagePublished(t, db, first.ID)
+	var eventCount int
+	if err := db.Get(&eventCount, `SELECT COUNT(*) FROM outbox_events WHERE kind = 'message_created' AND message_id = ?`, first.ID); err != nil || eventCount != 1 {
+		t.Fatalf("first message has %d outbox events: %v", eventCount, err)
+	}
 	second := send(t, server, path, alice.Token, 2)
 	// 下一个推送必须是第二条新消息，而不是第一条的重试。
 	assertPush(t, events, second)
 
 	conn.Close()
 	third, fourth := send(t, server, path, alice.Token, 3), send(t, server, path, alice.Token, 4)
+	waitMessagePublished(t, db, fourth.ID)
 	_, events = openDevice(t, server, bob.Token)
 	var missed []messageResponse
 	request(t, server, http.MethodGet, path+"?after_seq=2&limit=1", bob.Token, nil, http.StatusOK, &missed)
@@ -178,6 +186,15 @@ func TestDirectChatMySQL(t *testing.T) {
 	if len(missed) != 2 || missed[0] != third || missed[1] != second {
 		t.Fatalf("unexpected history page: %+v", missed)
 	}
+	checkPath := "/api/v1/conversations/" + conversation.ID + "/sync-state"
+	var syncState struct {
+		LastSeq string `json:"last_seq"`
+	}
+	request(t, server, http.MethodGet, checkPath, bob.Token, nil, http.StatusOK, &syncState)
+	if syncState.LastSeq != "4" {
+		t.Fatalf("sync state: %+v", syncState)
+	}
+	assertGroupError(t, server, http.MethodGet, checkPath, outsider.Token, nil, codeNotConversationUser)
 	fifth := send(t, server, path, alice.Token, 5)
 	assertPush(t, events, fifth)
 	request(t, server, http.MethodGet, "/api/v1/conversations", bob.Token, nil, http.StatusOK, &summaries)
@@ -186,6 +203,7 @@ func TestDirectChatMySQL(t *testing.T) {
 	}
 	assertReadProgress(t, server, alice.Token, 0, 0)
 	assertReadProgress(t, server, bob.Token, 0, 5)
+	_, secondDeviceEvents := openDevice(t, server, bob.Token)
 	readPath := "/api/v1/conversations/" + conversation.ID + "/read"
 	var read apiResponse
 	request(t, server, http.MethodPost, readPath, bob.Token, map[string]string{"seq": "3"}, http.StatusOK, &read)
@@ -193,8 +211,12 @@ func TestDirectChatMySQL(t *testing.T) {
 		t.Fatalf("mark read response data = %s, want null", read.Data)
 	}
 	assertReadProgress(t, server, bob.Token, 3, 2)
-	for _, seq := range []string{"3", "1"} {
-		request(t, server, http.MethodPost, readPath, bob.Token, map[string]string{"seq": seq}, http.StatusOK, nil)
+	assertReadEvent(t, events, fifth.ConversationID, 3)
+	assertReadEvent(t, secondDeviceEvents, fifth.ConversationID, 3)
+	for _, value := range []int64{3, 1} {
+		request(t, server, http.MethodPost, readPath, bob.Token, map[string]string{"seq": fmt.Sprint(value)}, http.StatusOK, nil)
+		// 重复或较早的请求可以通知，客户端的已读位置只前进。
+		assertReadEvent(t, events, fifth.ConversationID, value)
 	}
 	request(t, server, http.MethodPost, readPath, bob.Token, map[string]string{"seq": "6"}, http.StatusBadRequest, &read)
 	if read.Code != codeInvalidRequest {
@@ -239,6 +261,33 @@ func TestDirectChatMySQL(t *testing.T) {
 	assertReadProgress(t, server, bob.Token, 3, 3)
 	request(t, server, http.MethodPost, readPath, bob.Token, map[string]string{"seq": "7"}, http.StatusOK, nil)
 	assertReadProgress(t, server, bob.Token, 7, 0)
+
+	var targeted []conversationResponse
+	request(t, server, http.MethodGet, "/api/v1/conversations?ids="+conversation.ID+",999999999", bob.Token, nil, http.StatusOK, &targeted)
+	if len(targeted) != 1 || targeted[0].LastReadSeq != 7 || targeted[0].LastSeq != 7 || targeted[0].UnreadCount != 0 {
+		t.Fatalf("targeted summary: %+v", targeted)
+	}
+	request(t, server, http.MethodGet, "/api/v1/conversations?ids="+conversation.ID, outsider.Token, nil, http.StatusOK, &targeted)
+	if len(targeted) != 0 {
+		t.Fatalf("non-member summary: %+v", targeted)
+	}
+	var versions []conversationVersion
+	request(t, server, http.MethodGet, "/api/v1/conversations/versions", bob.Token, nil, http.StatusOK, &versions)
+	if len(versions) != 1 || versions[0].LastReadSeq != 7 || versions[0].LastSeq != 7 {
+		t.Fatalf("conversation versions: %+v", versions)
+	}
+}
+
+func assertReadEvent(t *testing.T, events <-chan messageEvent, id, seq int64) {
+	t.Helper()
+	select {
+	case event := <-events:
+		if event.Type != "conversation.read" || event.Data.ConversationID != id || event.Data.Seq != seq {
+			t.Fatalf("read event = %+v, want %d:%d", event, id, seq)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("missing conversation.read event")
+	}
 }
 
 func assertReadProgress(t *testing.T, server *httptest.Server, token string, seq, unread int64) {

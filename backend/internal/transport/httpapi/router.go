@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -17,6 +19,8 @@ import (
 )
 
 type handler struct {
+	avatarDir  string
+	imageSlots chan struct{}
 	points     *points.Store
 	redPackets *redpacket.Service
 	users      *user.Store
@@ -28,8 +32,13 @@ type handler struct {
 }
 
 func NewRouter(users *user.Store, chatService *chat.Service, friends *friendship.Service, hub *realtime.Hub, jwtSecret []byte, pointStore *points.Store, redPackets *redpacket.Service) *gin.Engine {
-	h := &handler{users: users, chat: chatService, friends: friends, hub: hub, jwtSecret: jwtSecret, points: pointStore, redPackets: redPackets}
+	h := &handler{imageSlots: make(chan struct{}, 4), users: users, chat: chatService, friends: friends, hub: hub, jwtSecret: jwtSecret, points: pointStore, redPackets: redPackets}
+	h.avatarDir = os.Getenv("IM_AVATAR_DIR")
+	if h.avatarDir == "" {
+		h.avatarDir = "avatars"
+	}
 	router := gin.New()
+	router.GET("/avatars/:name", h.serveAvatar)
 	// /ws 的查询参数里有票据，不能使用会打印原始请求的日志或 Recovery。
 	router.Use(gin.CustomRecoveryWithWriter(io.Discard, func(c *gin.Context, _ any) {
 		slog.Error("request panicked", "route", c.FullPath())
@@ -48,10 +57,18 @@ func NewRouter(users *user.Store, chatService *chat.Service, friends *friendship
 	router.GET("/ws", h.openWebSocket)
 
 	api := router.Group("/api/v1")
+	api.Use(func(c *gin.Context) {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+		defer cancel()
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+	})
 	api.POST("/auth/register", h.register)
 	api.POST("/auth/login", h.login)
 
 	protected := api.Group("", h.requireBearer)
+	protected.GET("/me", h.me)
+	protected.PATCH("/me/avatar", h.uploadAvatar)
 	protected.POST("/ws/tickets", h.issueWSTicket)
 	protected.GET("/users/by-username", h.lookupUser)
 	protected.GET("/friends", h.listFriends)
@@ -61,8 +78,11 @@ func NewRouter(users *user.Store, chatService *chat.Service, friends *friendship
 	protected.PATCH("/friend-requests/:id", h.resolveFriendRequest)
 	protected.POST("/conversations/direct", h.createDirect)
 	protected.GET("/conversations", h.listConversations)
+	protected.GET("/conversations/versions", h.listConversationVersions)
 	protected.POST("/conversations/:id/messages", h.sendMessage)
+	protected.GET("/messages/:id/image", h.readImage)
 	protected.GET("/conversations/:id/messages", h.listMessages)
+	protected.GET("/conversations/:id/sync-state", h.getSyncState)
 	protected.POST("/conversations/:id/read", h.markRead)
 	protected.GET("/points/balance", h.pointBalance)
 	protected.GET("/points/ledger", h.pointLedger)

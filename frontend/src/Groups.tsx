@@ -41,7 +41,7 @@ function FriendPicker({ api, excluded, selected, onChange, limit, disabled }: {
           <input type="checkbox" checked={checked} disabled={!checked && selected.length >= limit} onChange={() => {
             onChange(checked ? selected.filter((id) => id !== friend.id) : [...selected, friend.id]);
           }} />
-          <Avatar name={friend.nickname} /><span>{friend.nickname} <small>@{friend.username}</small></span>
+          <Avatar name={friend.nickname} src={friend.avatar_url} /><span>{friend.nickname} <small>@{friend.username}</small></span>
         </label>;
       })}
     </div>
@@ -155,7 +155,7 @@ export function GroupPanel({ api, id, userID, revision, epoch, onClose, onChange
       </form>}
       <ul className="group-members">
         {group.members.map((member) => <li key={member.id}>
-          <Avatar name={member.nickname} />
+          <Avatar name={member.nickname} src={member.avatar_url} />
           <div className="group-member-name"><strong>{member.nickname}</strong><small>@{member.username} · {roleLabels[member.role]}</small></div>
           {member.id !== userID && <div className="group-actions">
             {role === "owner" && <>

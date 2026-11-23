@@ -25,6 +25,7 @@ type MessageCreated struct {
 	ID              int64            `json:"id,string"`
 	ConversationID  int64            `json:"conversation_id,string"`
 	SenderID        int64            `json:"sender_id,string"`
+	SenderAvatarURL string           `json:"sender_avatar_url,omitempty"`
 	SenderNickname  string           `json:"sender_nickname"`
 	ClientMsgID     string           `json:"client_msg_id"`
 	Seq             int64            `json:"seq,string"`
@@ -33,9 +34,9 @@ type MessageCreated struct {
 }
 
 // NewMessageCreated 为 HTTP 和实时推送生成同一种消息格式。
-func NewMessageCreated(message chat.Message, nickname string) MessageCreated {
+func NewMessageCreated(message chat.Message, nickname string, avatarURL string) MessageCreated {
 	return MessageCreated{ID: message.ID, ConversationID: message.ConversationID, SenderID: message.SenderID,
-		SenderNickname: nickname, ClientMsgID: message.ClientMsgID, Seq: message.Seq, Content: message.Content,
+		SenderNickname: nickname, SenderAvatarURL: avatarURL, ClientMsgID: message.ClientMsgID, Seq: message.Seq, Content: message.Content,
 		CreatedAt: message.CreatedAt, Kind: message.Kind, RedPacketID: message.RedPacketID}
 }
 
@@ -44,11 +45,17 @@ type PacketUpdated struct {
 	Status   string `json:"status"`
 }
 
+type ConversationRead struct {
+	ConversationID int64 `json:"conversation_id,string"`
+	Seq            int64 `json:"seq,string"`
+}
+
 type ConversationUpdated struct {
 	ConversationID int64 `json:"conversation_id,string"`
 }
 
 type Hub struct {
+	onPresence   func(int64)
 	mu           sync.RWMutex
 	users        map[int64]map[*client]struct{}
 	pingInterval time.Duration
@@ -116,6 +123,11 @@ func (h *Hub) PushMessages(userIDs []int64, event MessageCreated) error {
 	return h.push(userIDs, "message.created", event)
 }
 
+// PushConversationRead 只向同一账号的设备同步个人已读进度。
+func (h *Hub) PushConversationRead(userID int64, event ConversationRead) error {
+	return h.push([]int64{userID}, "conversation.read", event)
+}
+
 // PushConversationUpdated 提醒客户端重新查询会话，事件只携带会话 ID。
 func (h *Hub) PushConversationUpdated(userIDs []int64, event ConversationUpdated) error {
 	return h.push(userIDs, "conversation.updated", event)
@@ -170,24 +182,47 @@ func (h *Hub) Close() {
 	}
 }
 
+// SetPresenceListener 在 HTTP 服务启动前设置连接状态监听器。
+func (h *Hub) SetPresenceListener(listener func(int64)) { h.onPresence = listener }
+
+func (h *Hub) Online(id int64) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.users[id]) > 0
+}
+
+func (h *Hub) PushPresence(userIDs []int64) error {
+	return h.push(userIDs, "presence.updated", struct{}{})
+}
+
 func (h *Hub) register(userID int64, c *client) bool {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.users == nil {
+		h.mu.Unlock()
 		return false
 	}
-	if h.users[userID] == nil {
+	first := h.users[userID] == nil
+	if first {
 		h.users[userID] = make(map[*client]struct{})
 	}
 	h.users[userID][c] = struct{}{}
+	h.mu.Unlock()
+	if first && h.onPresence != nil {
+		h.onPresence(userID)
+	}
 	return true
 }
 
 func (h *Hub) unregister(userID int64, c *client) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	_, existed := h.users[userID][c]
 	delete(h.users[userID], c)
-	if len(h.users[userID]) == 0 {
+	last := existed && len(h.users[userID]) == 0
+	if last {
 		delete(h.users, userID)
+	}
+	h.mu.Unlock()
+	if last && h.onPresence != nil {
+		h.onPresence(userID)
 	}
 }

@@ -16,8 +16,8 @@ export function Icon({ name }: { name: keyof typeof icons }) {
     stroke="currentColor" strokeWidth="1.65" strokeLinecap="round" strokeLinejoin="round">{icons[name]}</svg>;
 }
 
-export function Avatar({ name }: { name: string }) {
+export function Avatar({ name, src }: { name: string; src?: string }) {
   const letters = Array.from(name);
   const tone = letters.reduce((value, letter) => (value * 31 + letter.charCodeAt(0)) % 5, 0);
-  return <span className="avatar" data-tone={tone} aria-hidden="true">{letters[0].toUpperCase()}</span>;
+  return <span className="avatar" data-tone={tone} aria-hidden="true"><img src={src || "/avatars/default.webp"} alt="" /></span>;
 }

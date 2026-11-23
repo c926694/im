@@ -66,9 +66,13 @@ func (h *handler) listFriends(c *gin.Context) {
 		internalError(c, err)
 		return
 	}
-	response := make([]user.Profile, 0, len(entries))
+	type friendResponse struct {
+		user.Profile
+		Online bool `json:"online"`
+	}
+	response := make([]friendResponse, 0, len(entries))
 	for _, entry := range entries {
-		response = append(response, profiles[entry.PeerID])
+		response = append(response, friendResponse{Profile: profiles[entry.PeerID], Online: h.hub.Online(entry.PeerID)})
 	}
 	respondSuccess(c, response)
 }

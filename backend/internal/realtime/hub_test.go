@@ -83,6 +83,35 @@ func TestHeartbeat(t *testing.T) {
 	}
 }
 
+func TestPresenceTracksFirstAndLastDevice(t *testing.T) {
+	hub := NewHub()
+	changes := make(chan bool, 4)
+	hub.SetPresenceListener(func(id int64) { changes <- hub.Online(id) })
+	server := startTestServer(t, hub)
+	expect := func(online bool) {
+		t.Helper()
+		select {
+		case actual := <-changes:
+			if actual != online {
+				t.Fatalf("online = %v, want %v", actual, online)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("presence notification missing")
+		}
+	}
+	phone := dialDevice(t, server, "/alice")
+	expect(true)
+	web := dialDevice(t, server, "/alice")
+	waitFor(t, "both devices online", func() bool { return len(userConnections(hub, 1)) == 2 })
+	phone.Close()
+	waitFor(t, "one device remains", func() bool { return len(userConnections(hub, 1)) == 1 })
+	if !hub.Online(1) {
+		t.Fatal("one remaining device must keep user online")
+	}
+	web.Close()
+	expect(false)
+}
+
 func TestSlowDeviceDoesNotBlockOtherDevice(t *testing.T) {
 	hub := NewHub()
 	hub.writeTimeout = 15 * time.Second

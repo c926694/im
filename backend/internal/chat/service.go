@@ -7,18 +7,26 @@ import (
 	"time"
 
 	"github.com/c926694/im/backend/internal/friendship"
+	"github.com/c926694/im/backend/internal/outbox"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 )
 
 // Service 组合聊天业务流程，并通过 Store 执行数据库读写。
 type Service struct {
-	store Store
+	store              Store
+	imageDir           string
+	onMessageCommitted func()
 }
 
 // NewService 创建聊天业务服务。
 func NewService(store Store) *Service {
-	return &Service{store: store}
+	return &Service{store: store, imageDir: ImageDirectory()}
+}
+
+// SetMessageCommittedListener 在服务启动前登记 Outbox 唤醒信号。
+func (s *Service) SetMessageCommittedListener(listener func()) {
+	s.onMessageCommitted = listener
 }
 
 // CreateDirect 校验账号和好友关系后创建或复用单聊。
@@ -62,7 +70,28 @@ func (s *Service) SendMessage(ctx context.Context, userID, conversationID int64,
 	if err != nil {
 		return SendResult{}, err
 	}
-	return result, tx.Commit()
+	if result.Created {
+		if err := recordMessageEvent(ctx, tx, result.Message.ID); err != nil {
+			return SendResult{}, err
+		}
+	}
+	return result, s.commitMessage(tx, result.Created)
+}
+
+// recordMessageEvent 使用保存消息的事务，避免已确认消息缺少待发通知。
+func recordMessageEvent(ctx context.Context, tx *sqlx.Tx, id int64) error {
+	return outbox.Add(ctx, tx, outbox.Event{Kind: outbox.MessageCreated, MessageID: &id})
+}
+
+// commitMessage 只在数据库确认提交后唤醒发布器。
+func (s *Service) commitMessage(tx *sqlx.Tx, created bool) error {
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if created && s.onMessageCommitted != nil {
+		s.onMessageCommitted()
+	}
+	return nil
 }
 
 // SaveMessage 在调用方的事务中保存聊天消息。prepare 仅在新消息通过权限检查后执行。
@@ -119,7 +148,7 @@ func (s *Service) SaveMessage(ctx context.Context, tx *sqlx.Tx, userID, conversa
 		ConversationID: conversationID, SenderID: userID, ClientMsgID: clientMsgID, Kind: kind,
 		Seq: conversation.LastSeq + 1, CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
 	}
-	if conversation.Kind == Group {
+	if conversation.Kind == Group && kind == RedPacketMessage {
 		members, err := s.store.ActiveMembers(ctx, tx, conversationID)
 		if err != nil {
 			return SendResult{}, err
@@ -144,8 +173,26 @@ func (s *Service) SaveMessage(ctx context.Context, tx *sqlx.Tx, userID, conversa
 }
 
 // ListConversations 查询当前用户可访问的会话摘要。
-func (s *Service) ListConversations(ctx context.Context, userID int64) ([]ConversationSummary, error) {
-	return s.store.ListConversations(ctx, userID)
+func (s *Service) ListConversations(ctx context.Context, userID int64, ids ...int64) ([]ConversationSummary, error) {
+	return s.store.ListConversations(ctx, userID, ids...)
+}
+
+func (s *Service) ListConversationVersions(ctx context.Context, userID int64) ([]ConversationSummary, error) {
+	return s.store.ListConversationVersions(ctx, userID)
+}
+
+// LastVisibleSeq 只检查成员资格和会话序号，供在线客户端核对漏收的尾部消息。
+func (s *Service) LastVisibleSeq(ctx context.Context, userID, conversationID int64) (int64, error) {
+	tx, err := s.store.BeginSnapshot(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if _, err := s.requireMember(ctx, tx, userID, conversationID); err != nil {
+		return 0, err
+	}
+	conversation, err := s.store.GetConversation(ctx, tx, conversationID)
+	return conversation.LastSeq, err
 }
 
 // History 检查会话成员身份后读取较早的历史消息。

@@ -6,12 +6,13 @@ import { timelineKey } from "./timeline";
 import type { Timeline, TimelineAction } from "./timeline";
 import { statusLabels } from "./useRealtime";
 import { PacketDetails, SendPacket } from "./RedPackets";
+import { ChatImage } from "./ChatImage";
 import { Avatar, Icon } from "./visuals";
 
 const messageTime = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit" });
 const messageDate = new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "long", day: "numeric" });
 
-export function Chat({ api, conversation, timeline, userID, username, status, epoch, dispatch, onBack, onFriendshipChanged, onRead, onGroupDetails, packetUpdate, packetStatuses }: {
+export function Chat({ api, conversation, timeline, userID, username, status, epoch, dispatch, onBack, onFriendshipChanged, onRead, onGroupDetails, ownAvatarURL, packetUpdate, packetStatuses }: {
   api: ChatAPI;
   conversation: Conversation;
   timeline: Timeline;
@@ -22,7 +23,8 @@ export function Chat({ api, conversation, timeline, userID, username, status, ep
   dispatch: Dispatch<TimelineAction>;
   onBack: () => void;
   onFriendshipChanged: () => void;
-  onRead: () => void;
+  onRead: (id: string, seq: string) => void;
+  ownAvatarURL?: string;
   onGroupDetails: () => void;
   packetUpdate?: { id: string };
   packetStatuses: Record<string, RedPacketStatus>;
@@ -36,9 +38,13 @@ export function Chat({ api, conversation, timeline, userID, username, status, ep
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [syncError, setSyncError] = useState("");
   const [syncAttempt, setSyncAttempt] = useState(0);
+  const [checkedLastSeq, setCheckedLastSeq] = useState(0n);
   const [syncedEpoch, setSyncedEpoch] = useState(0);
   const [content, setContent] = useState("");
   const [packetDialog, setPacketDialog] = useState<{ id: string } | "send" | null>(null);
+  const [imageDraft, setImageDraft] = useState<{ file: File; preview: string }>();
+  const imageAttempt = useRef<{ file: File; content: string; clientID: string } | null>(null);
+  const imageInput = useRef<HTMLInputElement>(null);
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState("");
   const [atBottom, setAtBottom] = useState(true);
@@ -52,8 +58,9 @@ export function Chat({ api, conversation, timeline, userID, username, status, ep
   const stickToBottom = useRef(true);
   const prependAnchor = useRef<{ element: HTMLElement; top: number } | null>(null);
   const initialized = timeline.oldestSeq !== null;
-  const needsSync = initialized && status === "online" &&
-    (epoch !== syncedEpoch || BigInt(conversation.last_seq) > timeline.cursor);
+  const needsSync = initialized && ((status === "online" && epoch !== syncedEpoch) ||
+    BigInt(conversation.last_seq) > timeline.cursor || checkedLastSeq > timeline.cursor);
+  const refreshMembership = useEffectEvent(onFriendshipChanged);
   const readCursor = useEffectEvent(() => timeline.cursor);
 
   useEffect(() => () => {
@@ -100,6 +107,33 @@ export function Chat({ api, conversation, timeline, userID, username, status, ep
   }, [api, id, key, joinedSeq, epoch, needsSync, syncAttempt, dispatch]);
 
   useEffect(() => {
+    if (!initialized || !pageVisible) return;
+    const controller = new AbortController();
+    let timer: number;
+    function schedule() {
+      timer = window.setTimeout(() => void check(), 25_000 + Math.random() * 10_000);
+    }
+    async function check() {
+      try {
+        // 即使最后一条推送遗漏，也能按连续游标发现并补齐。
+        const { last_seq } = await api.syncState(id, controller.signal);
+        if (!controller.signal.aborted) setCheckedLastSeq(BigInt(last_seq));
+      } catch (error) {
+        if (!controller.signal.aborted && error instanceof APIError && error.code === errorCode.notMember) {
+          refreshMembership();
+        }
+      } finally {
+        if (!controller.signal.aborted) schedule();
+      }
+    }
+    schedule();
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [api, id, initialized, pageVisible]);
+
+  useEffect(() => {
     const onVisibilityChange = () => setPageVisible(!document.hidden);
     document.addEventListener("visibilitychange", onVisibilityChange);
     return () => document.removeEventListener("visibilitychange", onVisibilityChange);
@@ -112,7 +146,7 @@ export function Chat({ api, conversation, timeline, userID, username, status, ep
     api.markRead(id, timeline.cursor.toString(), controller.signal).then(() => {
       if (controller.signal.aborted) return;
       setReadError("");
-      onRead();
+      onRead(id, timeline.cursor.toString());
     }).catch((error: Error) => {
       if (!controller.signal.aborted) setReadError(error.message);
     });
@@ -152,19 +186,38 @@ export function Chat({ api, conversation, timeline, userID, username, status, ep
     }
   }
 
+  useEffect(() => () => {
+    if (imageDraft) URL.revokeObjectURL(imageDraft.preview);
+  }, [imageDraft]);
+
+  function selectImage(file: File) {
+    if (sending) return;
+    if (file.size > 5 * 1024 * 1024) {
+      setSendError("图片不能超过 5 MiB。");
+      return;
+    }
+    setSendError("");
+    setImageDraft({ file, preview: URL.createObjectURL(file) });
+  }
+
   async function send(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (sending || !content.trim()) return;
+    if (sending || (!imageDraft && !content.trim())) return;
     // HTTP 请求失败时保留客户端 UUID，重试可以取回已保存的消息。
-    if (draft.current?.content !== content) {
+    if (!imageDraft && draft.current?.content !== content) {
       draft.current = { client_msg_id: crypto.randomUUID(), content };
     }
     setSending(true);
     setSendError("");
     try {
-      const message = await api.send(id, draft.current);
+      if (imageDraft && (imageAttempt.current?.file !== imageDraft.file || imageAttempt.current.content !== content)) {
+        imageAttempt.current = { file: imageDraft.file, content, clientID: crypto.randomUUID() };
+      }
+      const message = imageDraft ? await api.sendImage(id, imageDraft.file, imageAttempt.current!.clientID, content) : await api.send(id, draft.current!);
       stickToBottom.current = true;
       dispatch({ key, joinedSeq, source: "live", messages: [message] });
+      setImageDraft(undefined);
+      imageAttempt.current = null;
       draft.current = null;
       setContent("");
     } catch (error) {
@@ -183,6 +236,8 @@ export function Chat({ api, conversation, timeline, userID, username, status, ep
       <header className="chat-header">
         <button type="button" className="icon-button mobile-back" aria-label="返回会话" onClick={onBack}><Icon name="back" /></button>
         <h2 id="chat-title">{title}</h2>
+        {conversation.kind === "direct" && conversation.peer_online !== undefined &&
+          <span className="presence" data-online={conversation.peer_online}>{conversation.peer_online ? "在线" : "离线"}</span>}
         <span className="connection chat-connection" data-status={status}>{statusLabels[status]}</span>
         {conversation.kind === "group" && <button type="button" className="icon-button" aria-label="群详情" title="群详情"
           onClick={onGroupDetails}><Icon name="group" /></button>}
@@ -218,12 +273,15 @@ export function Chat({ api, conversation, timeline, userID, username, status, ep
                 {dayChanged && `${messageDate.format(time)} `}{messageTime.format(time)}
               </time>}
               {message.kind === "red_packet_claim" ? <p className="message-system" role="note">
-                {conversation.kind === "direct" ? own ? "你领取了红包" : "对方领取了你的红包" : `${sender} 领取了红包`}
+                {own ? "你领取了红包" : conversation.kind === "direct" ? `${sender} 领取了你的红包` : `${sender} 领取了红包`}
               </p> : <article className="message" data-own={own} data-packet-arrival={packetArrivalID === message.id}>
-                <Avatar name={sender} />
+                <Avatar name={sender} src={own ? ownAvatarURL : conversation.kind === "direct" ? conversation.peer_avatar_url : message.sender_avatar_url} />
                 <div className="message-body">
                   <span className={own ? "sr-only" : "message-sender"}>{own ? "我" : sender}</span>
-                  {message.kind === "red_packet" || message.red_packet_id || message.content === "[红包]" ?
+                  {message.kind === "image" ? <div className="chat-image-message">
+                    <ChatImage api={api} id={message.id} />
+                    {message.content !== "[图片]" && <p>{message.content}</p>}
+                  </div> : message.kind === "red_packet" || message.red_packet_id || message.content === "[红包]" ?
                     message.red_packet_id ? <button type="button" className={`packet-card${(packetStatuses[message.red_packet_id] ?? message.red_packet_status) === "claimed" ? " is-claimed" : ""}`}
                       data-status={packetStatuses[message.red_packet_id] ?? message.red_packet_status ?? "open"}
                       aria-label={own ? "查看红包领取情况" : "打开并领取积分红包"}
@@ -258,16 +316,31 @@ export function Chat({ api, conversation, timeline, userID, username, status, ep
       {conversation.kind === "group" || conversation.is_friend ? <form className="composer" onSubmit={send}>
         <label className="sr-only" htmlFor="message-content">消息</label>
         <textarea id="message-content" rows={3} value={content} readOnly={sending} aria-describedby="composer-shortcuts"
-          placeholder="输入消息" onChange={(event) => setContent(event.target.value)} onKeyDown={(event) => {
+          onPaste={(event) => {
+            const picture = Array.from(event.clipboardData.files).find((file) => file.type.startsWith("image/"));
+            if (!picture) return;
+            event.preventDefault();
+            selectImage(picture);
+          }} placeholder="输入消息" onChange={(event) => setContent(event.target.value)} onKeyDown={(event) => {
             // 输入法确认候选词时，Enter 交给输入法处理。
             if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing || event.keyCode === 229) return;
             event.preventDefault();
             if (!event.repeat) event.currentTarget.form?.requestSubmit();
           }} />
+        {imageDraft && <div className="composer-image">
+          <img src={imageDraft.preview} alt="待发送图片" />
+          <button type="button" disabled={sending} onClick={() => setImageDraft(undefined)}>移除图片</button>
+        </div>}
+        <input type="file" ref={imageInput} hidden accept="image/jpeg,image/png,image/webp" onChange={(event) => {
+          const file = event.currentTarget.files?.[0];
+          event.currentTarget.value = "";
+          if (file) selectImage(file);
+        }} />
         <div className="composer-toolbar">
           <p id="composer-shortcuts" className="hint"><Icon name="keyboard" /><span>Enter 发送 · Shift + Enter 换行</span></p>
+          <button type="button" disabled={sending} onClick={() => imageInput.current?.click()}>{imageDraft ? "替换图片" : "图片"}</button>
           <button type="button" className="packet-send" onClick={() => setPacketDialog("send")}>发红包</button>
-          <button type="submit" className="primary" disabled={sending || !content.trim()}>{sending ? "正在发送…" : "发送"}</button>
+          <button type="submit" className="primary" disabled={sending || (!imageDraft && !content.trim())}>{sending ? "正在发送…" : "发送"}</button>
         </div>
         {sendError && <p className="error" role="alert">{sendError}</p>}
       </form> : <p className="composer composer-locked" role="status">聊天记录仍可查看。成为好友后可以发送新消息。</p>}

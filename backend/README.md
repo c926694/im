@@ -45,6 +45,8 @@ go run ./cmd/im
 | `DELETE /api/v1/friends/:id` | `id` 为对方的用户 ID；解除好友并保留历史。 |
 | `POST /api/v1/conversations/direct` | JSON：`{"peer_username":"xiaoli"}`。双方互为好友时，返回新建或已有会话的 `id`。 |
 | `GET /api/v1/conversations` | 返回 `kind`、本次加入时的序号 `joined_seq`、最新序号 `last_seq`、最新可见消息预览 `last_message`、个人已读序号 `last_read_seq` 和未读数 `unread_count`。群聊提供 `group_name`，单聊提供 `peer_user_id`、`peer_nickname` 和 `is_friend`。 |
+| `GET /api/v1/conversations?ids=1,2` | 只返回指定且当前用户可访问的会话摘要，一次最多 50 个会话。 |
+| `GET /api/v1/conversations/versions` | 只返回当前用户会话的 ID、加入序号、最新序号和已读序号，用于发现通知遗漏。 |
 | `POST /api/v1/conversations/:id/messages` | JSON：`client_msg_id`（UUID）、`content`。返回已保存的消息，含 `sender_nickname`。重试复用同一个 UUID。 |
 | `GET /api/v1/conversations/:id/messages` | 返回消息数组。默认倒序查历史；`before_seq` 查询更早消息；`after_seq` 正序补拉，`0` 表示从当前可见范围的第一条开始。两个游标不能同时传。`limit` 默认 50、最多 100。 |
 | `POST /api/v1/conversations/:id/read` | JSON：`{"seq":"12"}`。推进当前成员的已读序号，成功返回 `data: null`；序号不能超过 `last_seq`，重复或较早的请求不会使进度倒退。 |
@@ -98,8 +100,9 @@ go run ./cmd/im
 ## WebSocket 连接层
 
 - Gin 消耗一次性票据后，调用 `hub.Serve(w, r, userID)`。票据最多有效 30 秒，且不超过 Bearer 凭证的剩余有效期；握手失败或重连均需重新领票。连接保持默认同源校验。
-- `chat.SendMessage` 首次提交成功后，Gin 调用 `hub.PushMessages`，向单聊对方或群聊当前成员的所有在线连接发送 `{"type":"message.created","data":{...}}`。`data` 与 HTTP 发消息的响应使用同一消息结构。推送不算送达或已读；客户端重连后用设备的同步游标补拉，按消息 ID 去重，只推进到已连续处理的最大 `seq`，不能用账号的 `last_read_seq` 代替。
+- 普通消息与 Outbox 同事务提交，RocketMQ 消费者按消息的当前可见范围调用 `hub.PushMessages`，向会话成员的在线设备发送 `{"type":"message.created","data":{...}}`。`data` 与 HTTP 发消息的响应使用同一消息结构。推送不算送达或已读；客户端重连后用设备的同步游标补拉，按消息 ID 去重，只推进到已连续处理的最大 `seq`，不能用账号的 `last_read_seq` 代替。
 - 群信息或成员发生变更后，`conversation.updated` 通知相关成员重新查询会话，事件只包含 `conversation_id`。
+- 已读更新通过 `conversation.read` 通知同一账号的在线设备。设备只接受向前推进的读进度；缺少计算未读所需的消息时查询该会话摘要。
 - 服务端每 30 秒发 Ping，收到 Pong 后将读期限延后 60 秒，单次写超时为 5 秒。连接队列最多 64 条，积压时只断开该连接。应用退出时显式调用 `hub.Close()`，关闭已升级的连接。
 - 在 `backend/` 下用 `go test -race ./internal/realtime` 运行真实 WebSocket 连接测试，不需要 MySQL。
 
@@ -109,12 +112,12 @@ go run ./cmd/im
 - `httpapi` 负责鉴权中间件、参数解析和错误映射。会话成员授权由 `chat` 业务用例执行，不能仅靠 HTTP 路由拦截。
 - `friendship` 和 `chat` 的 Service 负责业务规则、权限判断和事务流程，Store 执行查询及写入。处理好友申请时，带条件的更新只接受当前接收人对待处理申请的操作。
 - 创建单聊和发送新的单聊消息时检查好友状态。发送使用普通查询读取好友关系，以检查时的状态为准；会话行锁继续负责分配消息序号。群聊发送和成员变更共用会话行锁，确保成员资格变更和消息序号使用同一顺序。
-- HTTP 发送在 MySQL 提交后返回确认。文本消息在进程内推送，红包卡片通过 Outbox 推送。实时推送失败时，客户端可在重连、发现缺口或主动同步时按会话 `seq` 从数据库补拉。
+- HTTP 发送在 MySQL 提交后返回确认。文字、图片和红包通知均使用 Outbox。当前打开的会话每隔 25–35 秒通过 `GET /api/v1/conversations/:id/sync-state` 检查 `last_seq`，发现遗漏后按连续游标补拉。
 
 ## 红包通知与退款
 
 - 红包卡片按 `kind=red_packet` 和 `red_packet_id` 渲染。HTTP 与 WebSocket 的消息结构一致。余额不足使用 `40012`，领完使用 `40013`，到期使用 `40014`。
-- 创建、领取、退款在 MySQL 事务内写入 Outbox。发布器每秒查询待发送记录，使用事件 ID 作为 RocketMQ 消息键。收到成功确认后记录发布时间，发布失败按最多 60 秒的退避间隔重试。
+- 创建、领取、退款在 MySQL 事务内写入 Outbox。发布器收到提交信号后扫描待发送记录，并每秒检查未发布记录；每批最多 50 条，最多同时发送 8 条。事件 ID 用作 RocketMQ 消息键。收到成功确认后记录发布时间，发布失败按最多 60 秒的退避间隔重试。
 - 领取红包时，在同一事务内增加一条 `kind=red_packet_claim` 的会话消息、推进会话序号并写入 Outbox。单聊中领取者看到「你领取了红包」，发送者看到「对方领取了你的红包」；群聊成员看到领取者昵称和领取状态。
 - 单实例消费者按消息的当前可见范围发送 `message.created` 或 `red_packet.updated`。通知允许重复，客户端按消息 ID 去重并按需查询红包状态。
 - 红包份数归零后，状态通知更新聊天卡片；发送者和其他成员会看到「红包已领完」，卡片颜色随之变淡。历史消息也按数据库当前状态展示。

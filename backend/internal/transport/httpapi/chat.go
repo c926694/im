@@ -3,8 +3,10 @@ package httpapi
 import (
 	"errors"
 	"log/slog"
+	"mime"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -18,8 +20,8 @@ import (
 
 type messageResponse realtime.MessageCreated
 
-func newMessageResponse(message chat.Message, nickname string) messageResponse {
-	return messageResponse(realtime.NewMessageCreated(message, nickname))
+func newMessageResponse(message chat.Message, profile user.Profile) messageResponse {
+	return messageResponse(realtime.NewMessageCreated(message, profile.Nickname, profile.AvatarURL))
 }
 
 type conversationResponse struct {
@@ -28,6 +30,8 @@ type conversationResponse struct {
 	GroupName      string    `json:"group_name,omitempty"`
 	JoinedSeq      int64     `json:"joined_seq,string"`
 	PeerUserID     int64     `json:"peer_user_id,string,omitempty"`
+	PeerAvatarURL  string    `json:"peer_avatar_url,omitempty"`
+	PeerOnline     *bool     `json:"peer_online,omitempty"`
 	PeerNickname   string    `json:"peer_nickname,omitempty"`
 	IsFriend       bool      `json:"is_friend"`
 	LastSeq        int64     `json:"last_seq,string"`
@@ -70,7 +74,23 @@ func (h *handler) listConversations(c *gin.Context) {
 	ctx := c.Request.Context()
 	// 会话查询返回对方用户 ID，供后续批量查询昵称。
 	userID := authenticated(c).userID
-	conversations, err := h.chat.ListConversations(ctx, userID)
+	var ids []int64
+	if raw, present := c.GetQuery("ids"); present {
+		items := strings.Split(raw, ",")
+		if len(items) > 50 {
+			reject(c, "invalid_request")
+			return
+		}
+		for _, item := range items {
+			id, err := strconv.ParseInt(item, 10, 64)
+			if err != nil || id <= 0 {
+				reject(c, "invalid_request")
+				return
+			}
+			ids = append(ids, id)
+		}
+	}
+	conversations, err := h.chat.ListConversations(ctx, userID, ids...)
 	if err != nil {
 		internalError(c, err)
 		return
@@ -101,7 +121,13 @@ func (h *handler) listConversations(c *gin.Context) {
 	}
 	response := make([]conversationResponse, len(conversations))
 	for i, conversation := range conversations {
+		var online *bool
+		if accepted[conversation.PeerUserID] {
+			value := h.hub.Online(conversation.PeerUserID)
+			online = &value
+		}
 		response[i] = conversationResponse{
+			PeerOnline: online, PeerAvatarURL: profiles[conversation.PeerUserID].AvatarURL,
 			ID: conversation.ID, PeerUserID: conversation.PeerUserID, PeerNickname: profiles[conversation.PeerUserID].Nickname,
 			Kind: conversation.Kind, GroupName: conversation.GroupName, JoinedSeq: conversation.JoinedSeq,
 			IsFriend: accepted[conversation.PeerUserID],
@@ -113,7 +139,32 @@ func (h *handler) listConversations(c *gin.Context) {
 	respondSuccess(c, response)
 }
 
+type conversationVersion struct {
+	ID          int64 `json:"id,string"`
+	JoinedSeq   int64 `json:"joined_seq,string"`
+	LastSeq     int64 `json:"last_seq,string"`
+	LastReadSeq int64 `json:"last_read_seq,string"`
+}
+
+func (h *handler) listConversationVersions(c *gin.Context) {
+	versions, err := h.chat.ListConversationVersions(c.Request.Context(), authenticated(c).userID)
+	if err != nil {
+		internalError(c, err)
+		return
+	}
+	result := make([]conversationVersion, 0, len(versions))
+	for _, item := range versions {
+		result = append(result, conversationVersion{item.ID, item.JoinedSeq, item.LastSeq, item.LastReadSeq})
+	}
+	respondSuccess(c, result)
+}
+
 func (h *handler) sendMessage(c *gin.Context) {
+	mediaType, _, _ := mime.ParseMediaType(c.GetHeader("Content-Type"))
+	if mediaType == "multipart/form-data" {
+		h.sendImage(c)
+		return
+	}
 	conversationID, ok := conversationParam(c)
 	if !ok {
 		return
@@ -145,14 +196,20 @@ func (h *handler) sendMessage(c *gin.Context) {
 		chatError(c, err)
 		return
 	}
-	// 只推送首次写入的消息；在线通知失败也不能改掉已成功保存的结果。
-	response := newMessageResponse(result.Message, profiles[senderID].Nickname)
-	if result.Created {
-		if err := h.hub.PushMessages(result.Recipients, realtime.MessageCreated(response)); err != nil {
-			slog.Warn("message saved but push failed", "message_id", result.Message.ID, "error", err)
-		}
+	respondSuccess(c, newMessageResponse(result.Message, profiles[senderID]))
+}
+
+func (h *handler) getSyncState(c *gin.Context) {
+	id, ok := conversationParam(c)
+	if !ok {
+		return
 	}
-	respondSuccess(c, response)
+	seq, err := h.chat.LastVisibleSeq(c.Request.Context(), authenticated(c).userID, id)
+	if err != nil {
+		chatError(c, err)
+		return
+	}
+	respondSuccess(c, gin.H{"last_seq": strconv.FormatInt(seq, 10)})
 }
 
 func (h *handler) listMessages(c *gin.Context) {
@@ -204,7 +261,7 @@ func (h *handler) listMessages(c *gin.Context) {
 		}
 	}
 	for i, message := range messages {
-		response[i] = newMessageResponse(message, profiles[message.SenderID].Nickname)
+		response[i] = newMessageResponse(message, profiles[message.SenderID])
 		if message.RedPacketID != nil {
 			status, ok := packetStatuses[*message.RedPacketID]
 			if !ok {
@@ -230,9 +287,13 @@ func (h *handler) markRead(c *gin.Context) {
 		reject(c, "invalid_read_seq")
 		return
 	}
-	if err := h.chat.MarkRead(c.Request.Context(), authenticated(c).userID, conversationID, *form.Seq); err != nil {
+	userID := authenticated(c).userID
+	if err := h.chat.MarkRead(c.Request.Context(), userID, conversationID, *form.Seq); err != nil {
 		chatError(c, err)
 		return
+	}
+	if err := h.hub.PushConversationRead(userID, realtime.ConversationRead{ConversationID: conversationID, Seq: *form.Seq}); err != nil {
+		slog.Warn("push read progress", "error", err)
 	}
 	respondSuccess(c, nil)
 }

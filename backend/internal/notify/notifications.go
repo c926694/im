@@ -1,4 +1,4 @@
-package app
+package notify
 
 import (
 	"context"
@@ -11,16 +11,34 @@ import (
 	"github.com/c926694/im/backend/internal/user"
 )
 
-type packetNotifier struct {
+type Notifier struct {
 	chat       *chat.Service
 	redPackets *redpacket.Service
 	users      *user.Store
 	hub        *realtime.Hub
 }
 
-// notify 读取消费时的消息可见范围，通知重复也不会变更积分。
-func (n packetNotifier) notify(ctx context.Context, event outbox.Event) error {
+func New(chats *chat.Service, packets *redpacket.Service, users *user.Store, hub *realtime.Hub) Notifier {
+	return Notifier{chat: chats, redPackets: packets, users: users, hub: hub}
+}
+
+// Deliver 读取消费时的消息可见范围，通知重复也不会变更积分。
+func (n Notifier) Deliver(ctx context.Context, event outbox.Event) error {
 	switch event.Kind {
+	case outbox.MessageCreated:
+		if event.MessageID == nil {
+			return fmt.Errorf("message event %d is missing its chat message", event.ID)
+		}
+		message, recipients, err := n.chat.MessageAudience(ctx, *event.MessageID)
+		if err != nil || len(recipients) == 0 {
+			return err
+		}
+		profiles, err := n.users.ProfilesByIDs(ctx, []int64{message.SenderID})
+		if err != nil {
+			return err
+		}
+		profile := profiles[message.SenderID]
+		return n.hub.PushMessages(recipients, realtime.NewMessageCreated(message, profile.Nickname, profile.AvatarURL))
 	case outbox.Created:
 		message, recipients, err := n.chat.PacketAudience(ctx, event.PacketID)
 		if err != nil {
@@ -33,7 +51,7 @@ func (n packetNotifier) notify(ctx context.Context, event outbox.Event) error {
 		if err != nil {
 			return err
 		}
-		created := realtime.NewMessageCreated(message, profiles[message.SenderID].Nickname)
+		created := realtime.NewMessageCreated(message, profiles[message.SenderID].Nickname, profiles[message.SenderID].AvatarURL)
 		statuses, err := n.redPackets.Statuses(ctx, []int64{event.PacketID})
 		if err != nil {
 			return err
@@ -56,7 +74,7 @@ func (n packetNotifier) notify(ctx context.Context, event outbox.Event) error {
 		if err != nil {
 			return err
 		}
-		if err := n.hub.PushMessages(claimRecipients, realtime.NewMessageCreated(claimMessage, profiles[claimMessage.SenderID].Nickname)); err != nil {
+		if err := n.hub.PushMessages(claimRecipients, realtime.NewMessageCreated(claimMessage, profiles[claimMessage.SenderID].Nickname, profiles[claimMessage.SenderID].AvatarURL)); err != nil {
 			return err
 		}
 		_, packetRecipients, err := n.chat.PacketAudience(ctx, event.PacketID)
