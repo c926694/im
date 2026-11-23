@@ -1,9 +1,12 @@
 FROM golang:1.26-alpine AS build
 WORKDIR /src
+ARG GOPROXY=https://proxy.golang.org,direct
 COPY backend/go.mod backend/go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY backend/ ./
-RUN CGO_ENABLED=0 go build -trimpath -o /out/im ./cmd/im
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -o /out/im ./cmd/im
 
 FROM alpine:3.23
 COPY --from=build /out/im /usr/local/bin/im

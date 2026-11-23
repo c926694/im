@@ -141,6 +141,10 @@ func TestRedPacketsMySQL(t *testing.T) {
 	request(t, server, http.MethodPost, groupSendPath, alice.Token, packetInput(3, "30", 2), http.StatusOK, &expiring)
 	expiringPath := "/api/v1/red-packets/" + expiring.ID
 	request(t, server, http.MethodPost, expiringPath+"/claim", bob.Token, nil, http.StatusOK, nil)
+	expiringID, _ := strconv.ParseInt(expiring.ID, 10, 64)
+	if err := packets.RefundDue(context.Background(), expiringID); err != redpacket.ErrNotYetExpired {
+		t.Fatalf("refund before expiry: %v", err)
+	}
 	if _, err := db.Exec(`UPDATE red_packets SET expires_at = UTC_TIMESTAMP(6) WHERE id = ?`, expiring.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +153,7 @@ func TestRedPacketsMySQL(t *testing.T) {
 	concurrent.Add(3)
 	failures := make(chan error, 3)
 	for range 2 {
-		go func() { defer concurrent.Done(); failures <- packets.RefundExpired(context.Background()) }()
+		go func() { defer concurrent.Done(); failures <- packets.RefundDue(context.Background(), expiringID) }()
 	}
 	go func() {
 		defer concurrent.Done()
@@ -192,7 +196,7 @@ func TestRedPacketsMySQL(t *testing.T) {
 	request(t, server, http.MethodPost, groupPath+"/members", alice.Token, map[string]any{"member_ids": []string{carol.ID}}, http.StatusOK, nil)
 	assertGroupError(t, server, http.MethodPost, expiringPath+"/claim", carol.Token, nil, codeNotConversationUser)
 	var eventCount int
-	if err := db.Get(&eventCount, `SELECT COUNT(*) FROM outbox_events WHERE red_packet_id = ?`, expiring.ID); err != nil || eventCount != 3 {
+	if err := db.Get(&eventCount, `SELECT COUNT(*) FROM outbox_events WHERE red_packet_id = ?`, expiring.ID); err != nil || eventCount != 4 {
 		t.Fatalf("red packet outbox events = %d: %v", eventCount, err)
 	}
 	request(t, server, http.MethodGet, "/api/v1/points/ledger?limit=1", alice.Token, nil, http.StatusOK, &ledger)

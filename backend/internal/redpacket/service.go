@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"log/slog"
 	"time"
 
 	"github.com/c926694/im/backend/internal/chat"
@@ -19,7 +18,10 @@ var (
 	ErrIneligible    = errors.New("user cannot claim this red packet")
 	ErrClaimed       = errors.New("red packet is fully claimed")
 	ErrExpired       = errors.New("red packet expired")
+	ErrNotYetExpired = errors.New("red packet has not expired")
 )
+
+const packetTTL = 24 * time.Hour
 
 type Service struct {
 	store *Store
@@ -63,6 +65,11 @@ func (s *Service) Send(ctx context.Context, userID, conversationID int64, draft 
 		if err := outbox.Add(ctx, tx, outbox.Event{Kind: outbox.Created, PacketID: packetID}); err != nil {
 			return chat.Message{}, err
 		}
+		// 到期任务与红包一起提交，发布重试继续使用业务截止时间。
+		deadline := result.Message.CreatedAt.Add(packetTTL)
+		if err := outbox.Add(ctx, tx, outbox.Event{Kind: outbox.PacketExpiry, PacketID: packetID, DeliverAt: &deadline}); err != nil {
+			return chat.Message{}, err
+		}
 	} else {
 		packet, err := getPacket(ctx, tx, packetID, false)
 		if err != nil {
@@ -78,7 +85,7 @@ func (s *Service) Send(ctx context.Context, userID, conversationID int64, draft 
 // preparePacket 根据同一次会话成员查询确定红包的目标和份数上限。
 func preparePacket(ctx context.Context, tx *sqlx.Tx, kind chat.Kind, recipients []int64, message *chat.Message, draft Draft) error {
 	packet := Packet{SenderID: message.SenderID, PointsPerShare: draft.PointsPerShare, ShareCount: draft.ShareCount,
-		Remaining: draft.ShareCount, ExpiresAt: message.CreatedAt.Add(24 * time.Hour)}
+		Remaining: draft.ShareCount, ExpiresAt: message.CreatedAt.Add(packetTTL)}
 	if kind == chat.Direct {
 		if draft.ShareCount != 1 {
 			return ErrInvalidShares
@@ -212,7 +219,8 @@ func lockedPacket(ctx context.Context, tx *sqlx.Tx, id int64) (Packet, time.Time
 	return packet, now, err
 }
 
-func (s *Service) refund(ctx context.Context, id int64) error {
+// RefundDue 处理指定红包；仅在事务提交或确认已结束后允许确认消费。
+func (s *Service) RefundDue(ctx context.Context, id int64) error {
 	tx, err := s.store.beginWrite(ctx)
 	if err != nil {
 		return err
@@ -222,8 +230,11 @@ func (s *Service) refund(ctx context.Context, id int64) error {
 	if err != nil {
 		return err
 	}
-	if packet.Status != Open || now.Before(packet.ExpiresAt) {
+	if packet.Status != Open {
 		return nil
+	}
+	if now.Before(packet.ExpiresAt) {
+		return ErrNotYetExpired
 	}
 	if err := updatePacket(ctx, tx, id, 0, Refunded); err != nil {
 		return err
@@ -235,37 +246,4 @@ func (s *Service) refund(ctx context.Context, id int64) error {
 		return err
 	}
 	return tx.Commit()
-}
-
-// RefundExpired 扫描到期索引，并为每个红包各自提交退款事务。
-func (s *Service) RefundExpired(ctx context.Context) error {
-	ids, err := s.store.expiredIDs(ctx)
-	if err != nil {
-		return err
-	}
-	var failures error
-	for _, id := range ids {
-		if err := s.refund(ctx, id); err != nil {
-			failures = errors.Join(failures, err)
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-	}
-	return failures
-}
-
-func (s *Service) RunRefunds(ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-	for ctx.Err() == nil {
-		if err := s.RefundExpired(ctx); err != nil && ctx.Err() == nil {
-			slog.Error("refund expired red packets", "error", err)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
 }

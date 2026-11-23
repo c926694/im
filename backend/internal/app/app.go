@@ -65,15 +65,20 @@ func Run(ctx context.Context) error {
 	if mqAddr == "" {
 		return errors.New("IM_ROCKETMQ_NAMESRV is required")
 	}
+	expiryEndpoint := os.Getenv("IM_ROCKETMQ_PROXY")
+	if expiryEndpoint == "" {
+		return errors.New("IM_ROCKETMQ_PROXY is required")
+	}
 	workerCtx, stopWorkers := context.WithCancel(ctx)
 	defer stopWorkers()
 	notifier := notify.New(chats, packets, users, hub)
 	events := outbox.NewStore(db)
 	chats.SetMessageCommittedListener(events.Wake)
 	var workers sync.WaitGroup
-	workers.Add(2)
+	workers.Add(3)
 	go func() { defer workers.Done(); rocketmq.Run(workerCtx, mqAddr, events, notifier.Deliver) }()
-	go func() { defer workers.Done(); packets.RunRefunds(workerCtx) }()
+	go func() { defer workers.Done(); rocketmq.RunExpiryPublisher(workerCtx, expiryEndpoint, events) }()
+	go func() { defer workers.Done(); rocketmq.RunExpiryConsumer(workerCtx, expiryEndpoint, packets.RefundDue) }()
 	defer func() {
 		stopWorkers()
 		workers.Wait()

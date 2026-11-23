@@ -16,7 +16,7 @@ docker compose --env-file docker/.env -f docker/compose.yaml ps
 | 后端 | Go 阶段编译程序，Alpine 镜像以非 root 用户运行。启动时连接 MySQL 并执行尚未成功的版本化迁移；直接访问 `http://127.0.0.1:8080` 可以测试 API，`/healthz` 检查 HTTP 服务，`/readyz` 检查 MySQL 是否可用。 |
 | MySQL | `127.0.0.1:3306`。`mysql-data` 挂载到 `/var/lib/mysql`，保存数据库文件。 |
 | Redis | `127.0.0.1:6379`。`redis-data` 挂载到 `/data`，保存 Redis 持久化文件。 |
-| RocketMQ | NameServer 和 Broker 在 Compose 网络内运行，NameServer 地址为 `rocketmq-namesrv:9876`。Broker 将消息数据写入 `rocketmq-data` 命名卷；卷在 `compose.yaml` 底部声明，并挂载到 `/home/rocketmq/store`。Broker 镜像以运行用户创建存储目录，新建卷可直接写入。一次性服务创建 `im_redpacket_events` Topic。后端通知工作进程在后台等待连接，HTTP 服务可在 MySQL 可用时启动。 |
+| RocketMQ | NameServer 和 Broker 在 Compose 网络内运行，NameServer 地址为 `rocketmq-namesrv:9876`。Broker 将消息数据写入 `rocketmq-data` 命名卷；卷在 `compose.yaml` 底部声明，并挂载到 `/home/rocketmq/store`。Broker 镜像以运行用户创建存储目录，新建卷可直接写入。Broker 同容器启用 RocketMQ Proxy，后端通过 `rocketmq-broker:8081` 发布和主动拉取退款任务。一次性服务创建普通通知 Topic `im_redpacket_events`、延迟 Topic `im_redpacket_expiry` 及退款消费组 `im_redpacket_refunds`。HTTP 服务可在 MySQL 可用时启动。 |
 
 聊天图片保存在 `chat-image-data` 数据卷，Gin 按消息 ID 校验权限后提供读取。备份时同时保存 MySQL 和该数据卷。升级至 `000009` 时，后端启动会复制历史图片到数据卷并保存相对路径，成功后删除旧图片数据表。
 
@@ -39,6 +39,16 @@ docker compose --env-file docker/.env -f docker/compose.yaml down
 ```
 
 Compose 在文件底部声明 `mysql-data`、`redis-data` 和 `rocketmq-data`，并在各服务中分别挂载到 MySQL、Redis、RocketMQ 的数据目录。要删除这些数据卷，才使用 `docker compose down -v`。
+
+## 配置 Go 依赖下载
+
+后端镜像默认通过 Go 官方代理下载模块，Compose 可从 `docker/.env` 读取 `IM_GO_PROXY`。如果 Docker 容器访问官方代理较慢，可以配置宿主机已经验证可用的代理，例如：
+
+```sh
+IM_GO_PROXY="$(go env GOPROXY)" docker compose -f docker/compose.yaml up -d --build --wait
+```
+
+构建缓存会保留已下载的模块和 Go 编译结果。构建时仍使用 `go.sum` 校验依赖。
 
 ## 初始化数据库和运行集成测试
 
@@ -92,3 +102,19 @@ Apple M5、16 GiB 内存，Docker 分配 10 个 CPU 和约 7.75 GiB 内存时，
 两组测试均无发送错误，接收端在测试期限内收到全部待核对的推送，补拉未发现遗漏。结果对应约 7.4 秒和 2.5 秒的短时负载，不代表长期容量或大图片吞吐量。故障演练从执行后端重启到就绪约 8.9 秒，从启动 RocketMQ 到在线设备收到待发通知约 24.6 秒。
 
 MySQL 备份与聊天图片数据卷应一起保存，并在独立环境验证恢复。Docker 重启策略可在进程退出后恢复服务；宿主机中断期间没有自动切换。
+
+### 红包到期退款
+
+迁移 `000011` 会为升级时仍未处理完的红包各登记一条到期任务。退款消费者使用独立的 RocketMQ 5.x 延迟 Topic 和消费组；业务数据库只在消费到任务后按红包 ID 查询及提交退款。
+
+排查时可在 MySQL 查询 `outbox_events` 中 `kind = 'packet_expiry' AND published_at IS NULL` 的记录，查看 `attempts` 和 `next_attempt_at`。RocketMQ 消费重试耗尽的任务可在死信 Topic `%DLQ%im_redpacket_refunds` 中检查。确认故障原因后，可以按红包 ID 查询其到期事件，把该事件的 `published_at` 设为空、`next_attempt_at` 设为当前 UTC 时间，使用原到期时间重发。退款事务会检查红包状态，重复通知不会增加余额。
+
+独立环境验证（脚本会创建测试账号、发送红包，并缩短其中一个测试红包的有效期）：
+
+```sh
+export IM_FRONTEND_PORT=18081 IM_BACKEND_PORT=18080 IM_MYSQL_PORT=13318 IM_REDIS_PORT=16380
+docker compose -p im-expiry-test -f docker/compose.yaml up -d --build --wait
+node scripts/im-refund-expiry.mjs
+```
+
+升级集成测试使用空的独立数据库 `im_expiry_upgrade_test`。在后端目录设置 `IM_EXPIRY_UPGRADE_TEST_DSN` 后，运行 `go test -race -count=1 ./internal/platform/mysql -run TestMigrateSchedulesOpenPackets`，验证升级会为已有的开放红包登记到期任务，重复执行迁移不会重复登记。

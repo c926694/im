@@ -71,6 +71,55 @@ func TestMigrateContinuesLegacySchema(t *testing.T) {
 	}
 }
 
+func TestMigrateSchedulesOpenPackets(t *testing.T) {
+	db := openMigrationTestDatabase(t, "IM_EXPIRY_UPGRADE_TEST_DSN", "im_expiry_upgrade_test")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	files, err := migrationFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := db.Connx(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, createMigrationTable); err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		if file.version > "000010" {
+			break
+		}
+		if err := applyMigration(ctx, conn, file); err != nil {
+			conn.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.ExecContext(ctx, `INSERT INTO red_packets (sender_id, points_per_share, share_count, remaining, status, expires_at)
+		VALUES (1, 10, 1, 1, 'open', UTC_TIMESTAMP(6) - INTERVAL 5 SECOND),
+		(1, 10, 1, 1, 'open', UTC_TIMESTAMP(6) + INTERVAL 12 HOUR),
+		(1, 10, 1, 0, 'claimed', UTC_TIMESTAMP(6))`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := Migrate(ctx, db); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var ids []int64
+	if err := db.SelectContext(ctx, &ids, `SELECT red_packet_id FROM outbox_events WHERE kind = 'packet_expiry' AND deliver_at IS NOT NULL ORDER BY red_packet_id`); err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 2 || ids[0] != 1 || ids[1] != 2 {
+		t.Fatalf("expiry tasks: %v", ids)
+	}
+}
+
 func openMigrationTestDatabase(t *testing.T, envName, expectedDBName string) *sqlx.DB {
 	t.Helper()
 	dsn := os.Getenv(envName)

@@ -89,12 +89,6 @@ func databaseTime(ctx context.Context, tx *sqlx.Tx) (time.Time, error) {
 	return now, err
 }
 
-func (s *Store) expiredIDs(ctx context.Context) ([]int64, error) {
-	var ids []int64
-	err := s.db.SelectContext(ctx, &ids, `SELECT id FROM red_packets WHERE status = 'open' AND expires_at <= UTC_TIMESTAMP(6) ORDER BY expires_at, id LIMIT 100`)
-	return ids, err
-}
-
 func (s *Store) statuses(ctx context.Context, packetIDs []int64) (map[int64]Status, error) {
 	statuses := make(map[int64]Status, len(packetIDs))
 	if len(packetIDs) == 0 {

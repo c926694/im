@@ -19,11 +19,12 @@ Go 模块位于 `backend/`。Gin 在同一个端口提供单聊和群聊 HTTP AP
 
 ## 启动服务
 
-通过 [Docker Compose](../docker/README.md) 启动 MySQL、RocketMQ 和后端。直接运行后端时需要可访问的 MySQL、NameServer、Broker 和 `im_redpacket_events` Topic；程序启动时会执行未完成的数据库迁移。在 `backend/` 下运行以下命令。
+通过 [Docker Compose](../docker/README.md) 启动 MySQL、RocketMQ 和后端。直接运行后端时需要可访问的 MySQL、NameServer、启用 Proxy 的 Broker、`im_redpacket_events` 和 `im_redpacket_expiry` Topic；程序启动时会执行未完成的数据库迁移。在 `backend/` 下运行以下命令。
 
 ```sh
 export IM_MYSQL_DSN='im_dev:im-local-app-example@tcp(127.0.0.1:3306)/im'
 export IM_ROCKETMQ_NAMESRV="${IM_ROCKETMQ_NAMESRV:?需要填写可访问的 NameServer 地址，例如 127.0.0.1:9876}"
+export IM_ROCKETMQ_PROXY="${IM_ROCKETMQ_PROXY:?需要填写可访问的 RocketMQ Proxy 地址}"
 export IM_JWT_SECRET="$(openssl rand -hex 32)"
 go run ./cmd/im
 ```
@@ -121,7 +122,7 @@ go run ./cmd/im
 - 领取红包时，在同一事务内增加一条 `kind=red_packet_claim` 的会话消息、推进会话序号并写入 Outbox。单聊中领取者看到「你领取了红包」，发送者看到「对方领取了你的红包」；群聊成员看到领取者昵称和领取状态。
 - 单实例消费者按消息的当前可见范围发送 `message.created` 或 `red_packet.updated`。通知允许重复，客户端按消息 ID 去重并按需查询红包状态。
 - 红包份数归零后，状态通知更新聊天卡片；发送者和其他成员会看到「红包已领完」，卡片颜色随之变淡。历史消息也按数据库当前状态展示。
-- 退款任务每 10 秒检查最多 100 个到期红包，领取和退款使用同一红包行锁。到期后领取接口立即拒绝新领取。
+- 创建红包时同事务登记 `packet_expiry`，通过延迟 Topic 按 `expires_at` 投递。独立的 `SimpleConsumer` 每批主动拉取最多 4 条任务，按红包 ID 访问 MySQL，提交退款后逐条确认。领取和退款使用同一红包行锁；到期后立即停止领取。
 
 ## 计划模块
 
