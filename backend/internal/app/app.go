@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/c926694/im/backend/internal/chat"
@@ -15,7 +14,6 @@ import (
 	"github.com/c926694/im/backend/internal/notify"
 	"github.com/c926694/im/backend/internal/outbox"
 	"github.com/c926694/im/backend/internal/platform/mysql"
-	"github.com/c926694/im/backend/internal/platform/rocketmq"
 	"github.com/c926694/im/backend/internal/points"
 	"github.com/c926694/im/backend/internal/realtime"
 	"github.com/c926694/im/backend/internal/redpacket"
@@ -69,20 +67,13 @@ func Run(ctx context.Context) error {
 	if expiryEndpoint == "" {
 		return errors.New("IM_ROCKETMQ_PROXY is required")
 	}
-	workerCtx, stopWorkers := context.WithCancel(ctx)
-	defer stopWorkers()
 	notifier := notify.New(chats, packets, users, hub)
 	events := outbox.NewStore(db)
 	chats.SetMessageCommittedListener(events.Wake)
-	var workers sync.WaitGroup
-	workers.Add(3)
-	go func() { defer workers.Done(); rocketmq.Run(workerCtx, mqAddr, events, notifier.Deliver) }()
-	go func() { defer workers.Done(); rocketmq.RunExpiryPublisher(workerCtx, expiryEndpoint, events) }()
-	go func() { defer workers.Done(); rocketmq.RunExpiryConsumer(workerCtx, expiryEndpoint, packets.RefundDue) }()
-	defer func() {
-		stopWorkers()
-		workers.Wait()
-	}()
+	stopMessaging := (messagingTasks{
+		nameServer: mqAddr, endpoint: expiryEndpoint, events: events, notifier: notifier, packets: packets,
+	}).Start(ctx)
+	defer stopMessaging()
 	friends := friendship.NewService(friendship.NewStore(db))
 	hub.SetPresenceListener(func(id int64) {
 		queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)

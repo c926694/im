@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/c926694/im/backend/internal/chat"
@@ -217,6 +219,18 @@ func lockedPacket(ctx context.Context, tx *sqlx.Tx, id int64) (Packet, time.Time
 	}
 	now, err := databaseTime(ctx, tx)
 	return packet, now, err
+}
+
+// HandleExpiry 解析到期通知中的红包 ID，并交给退款事务处理。
+func (s *Service) HandleExpiry(ctx context.Context, body []byte) error {
+	id, err := strconv.ParseInt(string(body), 10, 64)
+	if err != nil || id <= 0 {
+		return errors.New("invalid refund task packet ID")
+	}
+	if err := s.RefundDue(ctx, id); err != nil {
+		return fmt.Errorf("refund packet %d: %w", id, err)
+	}
+	return nil
 }
 
 // RefundDue 处理指定红包；仅在事务提交或确认已结束后允许确认消费。

@@ -109,6 +109,8 @@ go run ./cmd/im
 
 ## 依赖和事务边界
 
+- `internal/platform/rocketmq` 提供通用生产者、推式消费者和拉式消费者。应用启动时列出聊天通知发布与消费、红包到期发布与退款消费四项任务。发布任务持有可复用的生产者；消费任务分别调用 `notify.HandleMessage` 和 `redpacket.HandleExpiry`。
+
 - `cmd/im` 调用 `app`；`app` 负责把 HTTP 层、业务模块、数据库和连接管理器组装起来。业务模块不反向引用 `app`、Gin 处理器或 WebSocket 连接对象。
 - `httpapi` 负责鉴权中间件、参数解析和错误映射。会话成员授权由 `chat` 业务用例执行，不能仅靠 HTTP 路由拦截。
 - `friendship` 和 `chat` 的 Service 负责业务规则、权限判断和事务流程，Store 执行查询及写入。处理好友申请时，带条件的更新只接受当前接收人对待处理申请的操作。

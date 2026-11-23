@@ -2,7 +2,9 @@ package notify
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/c926694/im/backend/internal/chat"
 	"github.com/c926694/im/backend/internal/outbox"
@@ -20,6 +22,17 @@ type Notifier struct {
 
 func New(chats *chat.Service, packets *redpacket.Service, users *user.Store, hub *realtime.Hub) Notifier {
 	return Notifier{chat: chats, redPackets: packets, users: users, hub: hub}
+}
+
+// HandleMessage 解析聊天通知，按消费时的权限和业务状态推送。
+func (n Notifier) HandleMessage(ctx context.Context, body []byte) error {
+	var event outbox.Event
+	if err := json.Unmarshal(body, &event); err != nil {
+		return err
+	}
+	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return n.Deliver(queryCtx, event)
 }
 
 // Deliver 读取消费时的消息可见范围，通知重复也不会变更积分。

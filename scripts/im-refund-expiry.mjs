@@ -64,6 +64,26 @@ await sql(`START TRANSACTION; SET @deadline = UTC_TIMESTAMP(6) + INTERVAL 12 SEC
   WHERE ${scheduledWhere(quick)}; COMMIT;`);
 await waitFor("Broker did not accept the short delay", () => published(quick));
 assert.equal((await api(`/red-packets/${quick}`, peer.token)).status, "open");
+const lockTest = process.env.IM_REFUND_TEST_LOCK === "1";
+if (lockTest) {
+  // 独立数据库连接持有实际红包行锁，让第一次退款等待超过事务期限。
+  const lockName = `im-refund-test-${quick}`;
+  const lock = sql(`START TRANSACTION;
+    SELECT id FROM red_packets WHERE id = ${quick} FOR UPDATE;
+    SELECT GET_LOCK('${lockName}', 0); DO SLEEP(25); COMMIT; SELECT RELEASE_LOCK('${lockName}');`);
+  try {
+    await waitFor("test did not acquire the packet row lock", async () =>
+      (await sql(`SELECT IS_USED_LOCK('${lockName}') IS NOT NULL`)) === "1");
+    await waitFor("refund handler did not report an unacknowledged attempt", async () => {
+      const logs = await compose("logs", "--tail", "40", "backend");
+      return logs.split("\n").some((line) =>
+        line.includes("RocketMQ task remains unacknowledged") && line.includes(`refund packet ${quick}:`));
+    });
+    assert.equal((await api("/points/balance", sender.token)).balance, "980");
+  } finally {
+    await lock;
+  }
+}
 await waitFor("expiry was not refunded", async () => (await api(`/red-packets/${quick}`, peer.token)).status === "refunded");
 assert.equal((await api("/points/balance", sender.token)).balance, "990");
 const credit = (await api("/points/ledger", sender.token)).filter((row) => row.kind === "refund" && row.ref_id === quick);
@@ -74,4 +94,4 @@ await waitFor("redrive did not publish", () => published(quick));
 await sleep(2500);
 assert.equal((await api("/points/balance", sender.token)).balance, "990");
 assert.equal((await api("/points/ledger", sender.token)).filter((row) => row.kind === "refund" && row.ref_id === quick).length, 1);
-console.log(JSON.stringify({ accepted24HourTask: true, refundedShortTask: true, duplicateCredit: false }));
+console.log(JSON.stringify({ accepted24HourTask: true, refundedShortTask: true, duplicateCredit: false, retriedAfterLock: lockTest }));

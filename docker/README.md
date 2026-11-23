@@ -117,4 +117,6 @@ docker compose -p im-expiry-test -f docker/compose.yaml up -d --build --wait
 node scripts/im-refund-expiry.mjs
 ```
 
+也可通过 `IM_REFUND_TEST_LOCK=1 node scripts/im-refund-expiry.mjs` 在隔离测试库持有红包行锁，验证首次退款超时不会提前确认，RocketMQ 重投后仍只入账一次。
+
 升级集成测试使用空的独立数据库 `im_expiry_upgrade_test`。在后端目录设置 `IM_EXPIRY_UPGRADE_TEST_DSN` 后，运行 `go test -race -count=1 ./internal/platform/mysql -run TestMigrateSchedulesOpenPackets`，验证升级会为已有的开放红包登记到期任务，重复执行迁移不会重复登记。
