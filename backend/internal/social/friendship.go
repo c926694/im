@@ -1,4 +1,4 @@
-package friendship
+package social
 
 import (
 	"context"
@@ -13,15 +13,23 @@ var (
 	ErrIncomingRequest    = errors.New("the other user has already sent a friend request")
 	ErrAlreadyFriends     = errors.New("users are already friends")
 	ErrRequestUnavailable = errors.New("friend request cannot be processed by this user")
-	ErrNotFriends         = errors.New("users are not friends")
 )
 
-type Service struct {
-	store *Store
-}
+type FriendshipStatus string
 
-func NewService(store *Store) *Service {
-	return &Service{store: store}
+const (
+	Pending  FriendshipStatus = "pending"
+	Accepted FriendshipStatus = "accepted"
+	Rejected FriendshipStatus = "rejected"
+	Removed  FriendshipStatus = "removed"
+)
+
+type Relationship struct {
+	PeerID      int64            `db:"peer_id"`
+	RequestID   string           `db:"request_id"`
+	RequestedBy int64            `db:"requested_by"`
+	Status      FriendshipStatus `db:"status"`
+	RequestedAt time.Time        `db:"requested_at"`
 }
 
 func (s *Service) Request(ctx context.Context, requesterID, peerID int64) (Relationship, error) {
@@ -72,7 +80,7 @@ func (s *Service) Request(ctx context.Context, requesterID, peerID int64) (Relat
 	return current, nil
 }
 
-func (s *Service) Resolve(ctx context.Context, recipientID int64, requestID string, status Status) error {
+func (s *Service) Resolve(ctx context.Context, recipientID int64, requestID string, status FriendshipStatus) error {
 	// 在更新时同时匹配接收人和待处理状态，避免并发操作重复处理同一份申请。
 	count, err := s.store.resolvePending(ctx, recipientID, requestID, status)
 	if err != nil {
@@ -88,6 +96,6 @@ func (s *Service) Remove(ctx context.Context, userID, peerID int64) error {
 	return s.store.removeAccepted(ctx, userID, peerID)
 }
 
-func (s *Service) List(ctx context.Context, userID int64, status Status) ([]Relationship, error) {
+func (s *Service) List(ctx context.Context, userID int64, status FriendshipStatus) ([]Relationship, error) {
 	return s.store.list(ctx, userID, status)
 }

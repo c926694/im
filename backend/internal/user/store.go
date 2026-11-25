@@ -7,8 +7,6 @@ import (
 
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
-
-	"github.com/c926694/im/backend/internal/points"
 )
 
 var (
@@ -41,9 +39,11 @@ type Profile struct {
 	AvatarURL string `db:"avatar_url" json:"avatar_url"`
 }
 
+const selectProfile = `SELECT id, username, nickname, avatar_url FROM users`
+
 func (s *Store) FindProfileByUsername(ctx context.Context, username string) (Profile, error) {
 	var profile Profile
-	err := s.db.GetContext(ctx, &profile, `SELECT id, username, nickname, CONCAT('/avatars/', COALESCE(NULLIF(avatar_name, ''), 'default.webp')) AS avatar_url FROM users WHERE username = ?`, username)
+	err := s.db.GetContext(ctx, &profile, selectProfile+` WHERE username = ?`, username)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Profile{}, ErrUserNotFound
 	}
@@ -55,7 +55,7 @@ func (s *Store) ProfilesByIDs(ctx context.Context, ids []int64) (map[int64]Profi
 	if len(ids) == 0 {
 		return byID, nil
 	}
-	query, args, err := sqlx.In(`SELECT id, username, nickname, CONCAT('/avatars/', COALESCE(NULLIF(avatar_name, ''), 'default.webp')) AS avatar_url FROM users WHERE id IN (?)`, ids)
+	query, args, err := sqlx.In(selectProfile+` WHERE id IN (?)`, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -69,8 +69,8 @@ func (s *Store) ProfilesByIDs(ctx context.Context, ids []int64) (map[int64]Profi
 	return byID, nil
 }
 
-func (s *Store) SetAvatar(ctx context.Context, id int64, name string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE users SET avatar_name = ? WHERE id = ?`, name, id)
+func (s *Store) SetAvatar(ctx context.Context, id int64, avatarURL string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE users SET avatar_url = ? WHERE id = ?`, avatarURL, id)
 	return err
 }
 
@@ -86,7 +86,8 @@ func (s *Store) Register(ctx context.Context, username, password, nickname strin
 		return 0, err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `INSERT INTO users (username, password_hash, nickname) VALUES (?, ?, ?)`, username, hash, nickname)
+	result, err := tx.ExecContext(ctx, `INSERT INTO users (username, password_hash, nickname, point_balance)
+		VALUES (?, ?, ?, ?)`, username, hash, nickname, InitialPointBalance)
 	var dbErr *mysqldriver.MySQLError
 	if errors.As(err, &dbErr) && dbErr.Number == 1062 {
 		return 0, ErrUsernameTaken
@@ -98,8 +99,8 @@ func (s *Store) Register(ctx context.Context, username, password, nickname strin
 	if err != nil {
 		return 0, err
 	}
-	// 注册成功时账户和发放流水必须同时存在。
-	if err := points.OpenAccount(ctx, tx, id); err != nil {
+	// 初始余额和首笔发放流水由注册事务一起提交。
+	if err := insertPointEntry(ctx, tx, id, PointGrant, id, InitialPointBalance, InitialPointBalance); err != nil {
 		return 0, err
 	}
 	return id, tx.Commit()

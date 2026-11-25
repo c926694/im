@@ -20,13 +20,6 @@ type Image struct {
 	Content  []byte
 }
 
-func ImageDirectory() string {
-	if dir := os.Getenv("IM_CHAT_IMAGE_DIR"); dir != "" {
-		return dir
-	}
-	return "chat-images"
-}
-
 func (s *Service) SendImage(ctx context.Context, senderID, conversationID int64, clientID, caption string, image Image) (SendResult, error) {
 	// 文件同步在会话事务之外进行，同群的文字发送无需等待图片写入。
 	name := uuid.NewString() + "." + strings.TrimPrefix(image.MIMEType, "image/")
@@ -85,7 +78,7 @@ func (s *Service) ReadImage(ctx context.Context, userID, messageID int64) (Image
 	if err != nil {
 		return Image{}, err
 	}
-	member, err := s.requireMember(ctx, tx, userID, message.ConversationID)
+	member, err := s.RequireMember(ctx, tx, userID, message.ConversationID)
 	if err != nil {
 		return Image{}, err
 	}

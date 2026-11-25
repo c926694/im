@@ -6,37 +6,31 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
 	"time"
 
+	"github.com/gin-gonic/gin"
+
 	"github.com/c926694/im/backend/internal/chat"
-	"github.com/c926694/im/backend/internal/friendship"
+	"github.com/c926694/im/backend/internal/config"
 	"github.com/c926694/im/backend/internal/notify"
 	"github.com/c926694/im/backend/internal/outbox"
 	"github.com/c926694/im/backend/internal/platform/mysql"
-	"github.com/c926694/im/backend/internal/points"
+	"github.com/c926694/im/backend/internal/platform/rocketmq"
 	"github.com/c926694/im/backend/internal/realtime"
-	"github.com/c926694/im/backend/internal/redpacket"
+	"github.com/c926694/im/backend/internal/social"
 	"github.com/c926694/im/backend/internal/transport/httpapi"
 	"github.com/c926694/im/backend/internal/user"
 )
 
-func Run(ctx context.Context) error {
-	dsn, secret := os.Getenv("IM_MYSQL_DSN"), os.Getenv("IM_JWT_SECRET")
-	if dsn == "" {
-		return errors.New("IM_MYSQL_DSN is required")
-	}
-	if len(secret) < 32 {
-		return errors.New("IM_JWT_SECRET must be at least 32 bytes")
-	}
-	addr := os.Getenv("IM_HTTP_ADDR")
-	if addr == "" {
-		addr = "127.0.0.1:8080"
+func Run(ctx context.Context, cfg config.Config) error {
+	gin.SetMode(cfg.HTTP.Mode)
+	if err := rocketmq.ConfigureProxyLogger(); err != nil {
+		return fmt.Errorf("configure RocketMQ logger: %w", err)
 	}
 
-	db, err := mysql.Open(dsn)
+	db, err := mysql.Open(cfg.MySQL.DSN)
 	if err != nil {
-		return errors.New("invalid IM_MYSQL_DSN")
+		return errors.New("invalid mysql.dsn")
 	}
 	defer db.Close()
 	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -49,7 +43,7 @@ func Run(ctx context.Context) error {
 		return fmt.Errorf("migrate MySQL schema: %w", err)
 	}
 
-	if err := chat.MigrateImageFiles(ctx, db, chat.ImageDirectory()); err != nil {
+	if err := chat.MigrateImageFiles(ctx, db, cfg.Storage.ChatImageDir); err != nil {
 		return fmt.Errorf("migrate chat images: %w", err)
 	}
 
@@ -57,28 +51,21 @@ func Run(ctx context.Context) error {
 	hub := realtime.NewHub()
 	defer hub.Close()
 	users := user.NewStore(db)
-	chats := chat.NewService(chat.NewStore(db))
-	packets := redpacket.NewService(redpacket.NewStore(db), chats)
-	mqAddr := os.Getenv("IM_ROCKETMQ_NAMESRV")
-	if mqAddr == "" {
-		return errors.New("IM_ROCKETMQ_NAMESRV is required")
-	}
-	expiryEndpoint := os.Getenv("IM_ROCKETMQ_PROXY")
-	if expiryEndpoint == "" {
-		return errors.New("IM_ROCKETMQ_PROXY is required")
-	}
-	notifier := notify.New(chats, packets, users, hub)
+	socialStore := social.NewStore(db)
+	chatStore := chat.NewStore(db)
+	chats := chat.NewService(chatStore, socialStore, cfg.Storage.ChatImageDir)
+	socialService := social.NewService(socialStore, chats, chatStore)
+	notifier := notify.New(chats, socialService, users, hub)
 	events := outbox.NewStore(db)
 	chats.SetMessageCommittedListener(events.Wake)
 	stopMessaging := (messagingTasks{
-		nameServer: mqAddr, endpoint: expiryEndpoint, events: events, notifier: notifier, packets: packets,
+		nameServer: cfg.RocketMQ.NameServer, endpoint: cfg.RocketMQ.Proxy, events: events, notifier: notifier, packets: socialService,
 	}).Start(ctx)
 	defer stopMessaging()
-	friends := friendship.NewService(friendship.NewStore(db))
 	hub.SetPresenceListener(func(id int64) {
 		queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
-		entries, err := friends.List(queryCtx, id, friendship.Accepted)
+		entries, err := socialService.List(queryCtx, id, social.Accepted)
 		if err != nil {
 			if queryCtx.Err() == nil {
 				slog.Warn("query presence audience", "error", err)
@@ -95,7 +82,7 @@ func Run(ctx context.Context) error {
 		}
 	})
 	router := http.NewServeMux()
-	router.Handle("/", httpapi.NewRouter(users, chats, friends, hub, []byte(secret), points.NewStore(db), packets))
+	router.Handle("/", httpapi.NewRouter(users, chats, socialService, hub, []byte(cfg.Auth.JWTSecret), cfg.Storage.AvatarDir))
 	router.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
 		probeCtx, cancel := context.WithTimeout(r.Context(), time.Second)
 		defer cancel()
@@ -106,14 +93,14 @@ func Run(ctx context.Context) error {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	server := &http.Server{
-		Addr:              addr,
+		Addr:              cfg.HTTP.Addr,
 		Handler:           router,
 		ReadTimeout:       15 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	serveErr := make(chan error, 1)
 	go func() {
-		slog.Info("starting IM HTTP and WebSocket server", "addr", addr)
+		slog.Info("starting IM HTTP and WebSocket server", "addr", server.Addr)
 		serveErr <- server.ListenAndServe()
 	}()
 	select {

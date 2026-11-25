@@ -8,46 +8,10 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/c926694/im/backend/internal/chat"
-	"github.com/c926694/im/backend/internal/points"
 	"github.com/c926694/im/backend/internal/realtime"
-	"github.com/c926694/im/backend/internal/redpacket"
+	"github.com/c926694/im/backend/internal/social"
+	"github.com/c926694/im/backend/internal/user"
 )
-
-func (h *handler) pointBalance(c *gin.Context) {
-	balance, err := h.points.Balance(c.Request.Context(), authenticated(c).userID)
-	if err != nil {
-		internalError(c, err)
-		return
-	}
-	respondSuccess(c, gin.H{"balance": strconv.FormatInt(balance, 10)})
-}
-
-func (h *handler) pointLedger(c *gin.Context) {
-	query := c.Request.URL.Query()
-	var beforeID int64
-	var err error
-	if query.Has("before_id") {
-		beforeID, err = strconv.ParseInt(query.Get("before_id"), 10, 64)
-		if err != nil || beforeID <= 0 {
-			reject(c, "invalid_pagination")
-			return
-		}
-	}
-	limit := 50
-	if query.Has("limit") {
-		limit, err = strconv.Atoi(query.Get("limit"))
-		if err != nil || limit < 1 || limit > 100 {
-			reject(c, "invalid_pagination")
-			return
-		}
-	}
-	entries, err := h.points.Ledger(c.Request.Context(), authenticated(c).userID, beforeID, limit)
-	if err != nil {
-		internalError(c, err)
-		return
-	}
-	respondSuccess(c, entries)
-}
 
 func (h *handler) sendPacket(c *gin.Context) {
 	conversationID, ok := conversationParam(c)
@@ -59,7 +23,7 @@ func (h *handler) sendPacket(c *gin.Context) {
 		PointsPerShare int64  `json:"points_per_share,string"`
 		ShareCount     int    `json:"share_count"`
 	}
-	if err := c.ShouldBindJSON(&form); err != nil || form.ShareCount < 1 || form.ShareCount > chat.MaxGroupMembers-1 ||
+	if err := c.ShouldBindJSON(&form); err != nil || form.ShareCount < 1 || form.ShareCount > social.MaxGroupMembers-1 ||
 		form.PointsPerShare <= 0 || form.PointsPerShare > math.MaxInt64/int64(form.ShareCount) {
 		reject(c, "invalid_red_packet")
 		return
@@ -75,13 +39,13 @@ func (h *handler) sendPacket(c *gin.Context) {
 		internalError(c, err)
 		return
 	}
-	message, err := h.redPackets.Send(ctx, userID, conversationID, redpacket.Draft{
+	message, err := h.social.Send(ctx, userID, conversationID, social.Draft{
 		ClientMsgID: clientID, PointsPerShare: form.PointsPerShare, ShareCount: form.ShareCount})
 	if err != nil {
 		packetError(c, err)
 		return
 	}
-	statuses, err := h.redPackets.Statuses(ctx, []int64{*message.RedPacketID})
+	statuses, err := h.social.Statuses(ctx, []int64{*message.RedPacketID})
 	if err != nil {
 		internalError(c, err)
 		return
@@ -101,7 +65,7 @@ func (h *handler) packetDetails(c *gin.Context) {
 	if !ok {
 		return
 	}
-	details, err := h.redPackets.Details(c.Request.Context(), id, authenticated(c).userID)
+	details, err := h.social.Details(c.Request.Context(), id, authenticated(c).userID)
 	if err != nil {
 		packetError(c, err)
 		return
@@ -114,7 +78,7 @@ func (h *handler) claimPacket(c *gin.Context) {
 	if !ok {
 		return
 	}
-	claim, err := h.redPackets.Claim(c.Request.Context(), id, authenticated(c).userID)
+	claim, err := h.social.Claim(c.Request.Context(), id, authenticated(c).userID)
 	if err != nil {
 		packetError(c, err)
 		return
@@ -133,17 +97,17 @@ func packetParam(c *gin.Context) (int64, bool) {
 
 func packetError(c *gin.Context, err error) {
 	switch {
-	case errors.Is(err, redpacket.ErrNotFound):
+	case errors.Is(err, social.ErrNotFound):
 		reject(c, "red_packet_not_found")
-	case errors.Is(err, redpacket.ErrInvalidShares):
+	case errors.Is(err, social.ErrInvalidShares):
 		reject(c, "invalid_red_packet_shares")
-	case errors.Is(err, redpacket.ErrIneligible):
+	case errors.Is(err, social.ErrIneligible):
 		reject(c, "red_packet_ineligible")
-	case errors.Is(err, redpacket.ErrClaimed):
+	case errors.Is(err, social.ErrClaimed):
 		reject(c, "red_packet_claimed")
-	case errors.Is(err, redpacket.ErrExpired):
+	case errors.Is(err, social.ErrExpired):
 		reject(c, "red_packet_expired")
-	case errors.Is(err, points.ErrInsufficientBalance):
+	case errors.Is(err, user.ErrInsufficientBalance):
 		reject(c, "insufficient_points")
 	default:
 		chatError(c, err)

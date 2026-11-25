@@ -5,44 +5,45 @@
 ## 模块职责
 
 - `cmd/im` 和 `internal/app`：读取配置、组装依赖并启动服务。
-- `internal/user`：注册、登录、按完整用户名查找账号、批量查询资料。
-- `internal/friendship`：好友申请、关系状态和当前好友查询。
-- `internal/chat`：单聊、群聊、成员角色、消息历史和已读进度。
-- `internal/points` 保存积分余额和变动记录。
-- `internal/redpacket` 管理红包发送、领取和到期退款。
+- `internal/user`：注册、登录、账号资料、积分余额和变动记录。
+- `internal/social`：同一个 Go 包内管理好友、建群和成员变更、红包发送与领取及到期退款。按业务使用 `friendship.go`、`group.go`、`redpacket.go`，社交数据查询集中在 `store.go`。
+- `internal/chat`：单聊和群聊会话数据、成员访问权限、消息发送、历史记录和已读进度。
 - `internal/outbox` 和 `internal/platform/rocketmq` 发布已提交的红包事件并通知在线会话。
 - `internal/realtime`：WebSocket 连接管理、心跳和推送。
-- `internal/transport/httpapi`：Gin 路由、身份认证、请求解析和响应转换。
+- `internal/transport/httpapi`：Gin 路由、身份认证、请求解析和响应转换。`router.go` 组装中间件，`routes.go` 按认证、用户、聊天、社交和实时连接注册路由。
 - `internal/platform/mysql` 和 `migrations`：数据库连接配置和版本化 SQL 迁移。
 
 Go 模块位于 `backend/`。Gin 在同一个端口提供单聊和群聊 HTTP API 和 WebSocket 握手路由。容器启动方式见 [Docker Compose 说明](../docker/README.md)。
 
 ## 启动服务
 
-通过 [Docker Compose](../docker/README.md) 启动 MySQL、RocketMQ 和后端。直接运行后端时需要可访问的 MySQL、NameServer、启用 Proxy 的 Broker、`im_redpacket_events` 和 `im_redpacket_expiry` Topic；程序启动时会执行未完成的数据库迁移。在 `backend/` 下运行以下命令。
+通过 [Docker Compose](../docker/README.md) 启动 MySQL、RocketMQ 和后端。直接运行后端时，在 `backend/` 创建本地配置文件：
 
 ```sh
-export IM_MYSQL_DSN='im_dev:im-local-app-example@tcp(127.0.0.1:3306)/im'
-export IM_ROCKETMQ_NAMESRV="${IM_ROCKETMQ_NAMESRV:?需要填写可访问的 NameServer 地址，例如 127.0.0.1:9876}"
-export IM_ROCKETMQ_PROXY="${IM_ROCKETMQ_PROXY:?需要填写可访问的 RocketMQ Proxy 地址}"
-export IM_JWT_SECRET="$(openssl rand -hex 32)"
-go run ./cmd/im
+umask 077
+cp configs/config.example.yaml configs/config.yaml
+openssl rand -hex 32
 ```
 
-示例 DSN 仅用于本地开发。默认监听 `127.0.0.1:8080`，可通过 `IM_HTTP_ADDR` 修改。签名密钥至少 32 字节；更换密钥会使之前签发的 token 失效。非本地环境使用 HTTPS/WSS，反向代理日志也不要记录 `/ws` 的查询参数或 `Authorization` 请求头。
+将生成的密钥填入 `auth.jwt_secret`，按实际服务地址设置 `mysql.dsn`、`rocketmq.nameserver` 和 `rocketmq.proxy`。RocketMQ 需提供普通通知和红包到期两个 Topic。配置完成后，在 `backend/` 运行 `go run ./cmd/im`；程序默认读取 `configs/config.yaml`，并执行尚未完成的数据库迁移。
+
+示例监听 `127.0.0.1:8080`，可通过 `http.addr` 修改。头像和聊天图片目录由 `storage` 指定，相对路径以工作目录为准。配置文件包含数据库凭据和签名密钥，需保存在本地。更换密钥会使之前签发的 token 失效。非本地环境使用 HTTPS/WSS，反向代理日志也不要记录 `/ws` 的查询参数或 `Authorization` 请求头。
 
 ## HTTP API
+
+业务接口使用 `GET`、`PUT`、`POST` 和 `DELETE`。
 
 | 方法和路径 | 请求和结果 |
 | --- | --- |
 | `POST /api/v1/auth/register` | JSON：`username`、`password`、`nickname`。返回 `200` 和 `user_id`。 |
 | `POST /api/v1/auth/login` | JSON：`username`、`password`。返回 `user_id`、`access_token`、`expires_in`（秒，有效期 1 小时）。 |
+| `PUT /api/v1/me/avatar` | 上传 multipart 字段 `avatar`，返回 `avatar_url`。 |
 | `POST /api/v1/ws/tickets` | 返回 `ticket` 和 `expires_at`。用新票据连接 `GET /ws?ticket=...`。 |
 | `GET /api/v1/users/by-username?username=xiaoli` | 按完整用户名查询公开资料，返回 `id`、`username` 和 `nickname`。 |
 | `GET /api/v1/friends` | 返回当前好友的公开资料。 |
 | `POST /api/v1/friend-requests` | JSON：`peer_username`。返回申请 `id`、对方资料 `peer` 和方向 `direction`。 |
 | `GET /api/v1/friend-requests` | 返回待处理申请；`direction` 表示收到（`incoming`）或发出（`outgoing`）。 |
-| `PATCH /api/v1/friend-requests/:id` | 由接收人提交 `status`：`accepted` 同意或 `rejected` 拒绝。 |
+| `PUT /api/v1/friend-requests/:id` | 由接收人提交 `status`：`accepted` 同意或 `rejected` 拒绝。 |
 | `DELETE /api/v1/friends/:id` | `id` 为对方的用户 ID；解除好友并保留历史。 |
 | `POST /api/v1/conversations/direct` | JSON：`{"peer_username":"xiaoli"}`。双方互为好友时，返回新建或已有会话的 `id`。 |
 | `GET /api/v1/conversations` | 返回 `kind`、本次加入时的序号 `joined_seq`、最新序号 `last_seq`、最新可见消息预览 `last_message`、个人已读序号 `last_read_seq` 和未读数 `unread_count`。群聊提供 `group_name`，单聊提供 `peer_user_id`、`peer_nickname` 和 `is_friend`。 |
@@ -53,10 +54,10 @@ go run ./cmd/im
 | `POST /api/v1/conversations/:id/read` | JSON：`{"seq":"12"}`。推进当前成员的已读序号，成功返回 `data: null`；序号不能超过 `last_seq`，重复或较早的请求不会使进度倒退。 |
 | `POST /api/v1/groups` | JSON 包含 `name` 和 `member_ids`。创建群聊，返回会话 `id`。 |
 | `GET /api/v1/groups/:id` | 查询群名以及有效成员的资料和 `role`。 |
-| `PATCH /api/v1/groups/:id` | 群主提交 `name` 更新群名。 |
+| `PUT /api/v1/groups/:id` | 群主提交 `name` 更新群名。 |
 | `POST /api/v1/groups/:id/members` | 群主或管理员提交 `member_ids` 邀请自己的好友。 |
 | `DELETE /api/v1/groups/:id/members/:user_id` | 群主移除其他成员，管理员移除普通成员。 |
-| `PATCH /api/v1/groups/:id/members/:user_id` | 群主提交 `role`，可选 `admin` 和 `member`。 |
+| `PUT /api/v1/groups/:id/members/:user_id` | 群主提交 `role`，可选 `admin` 和 `member`。 |
 | `POST /api/v1/groups/:id/transfer` | 群主提交 `user_id`，把群主身份转给当前群成员。 |
 | `POST /api/v1/groups/:id/leave` | 成员退出。群主需要转让后退出，最后一名成员退出时关闭群。 |
 | `GET /api/v1/points/balance` | 返回当前用户的 `balance`。 |
@@ -71,13 +72,12 @@ go run ./cmd/im
 
 | 表 | 一行代表什么 |
 | --- | --- |
-| `users` | 一个注册账号，存登录名、密码哈希和昵称。 |
+| `users` | 一个注册账号，存登录名、密码哈希、昵称、头像相对 URL `avatar_url` 和可用积分余额 `point_balance`。 |
 | `friendships` | 一对用户的好友关系和最近一次申请，两人共用一条记录。 |
 | `conversations` | 一段单聊或群聊，存会话类型、最新消息序号和活动时间。群聊另外保存群名和关闭时间。 |
 | `conversation_members` | 一个用户在某个会话中的成员关系，存角色、加入与退出时间、可读起点和个人已读游标。 |
 | `messages` | 一条已保存的文本、红包卡片或红包领取通知，按会话序号分页并按发送者的客户端 UUID 去重。 |
-| `point_accounts` | 一个用户的可用积分余额。 |
-| `point_ledger` | 一次积分增减，保留变动后的余额和唯一业务编号。 |
+| `point_ledger` | 一次积分增减，逻辑关联 `users.id`，保留变动后的余额和唯一业务编号。 |
 | `red_packets` | 一个红包的发送者、领取规则、份数、状态和到期时间。 |
 | `red_packet_claims` | 一位用户对一个红包的领取结果。 |
 | `outbox_events` | 一条待发送至 RocketMQ 的红包通知。 |
@@ -113,12 +113,13 @@ go run ./cmd/im
 
 - `cmd/im` 调用 `app`；`app` 负责把 HTTP 层、业务模块、数据库和连接管理器组装起来。业务模块不反向引用 `app`、Gin 处理器或 WebSocket 连接对象。
 - `httpapi` 负责鉴权中间件、参数解析和错误映射。会话成员授权由 `chat` 业务用例执行，不能仅靠 HTTP 路由拦截。
-- `friendship` 和 `chat` 的 Service 负责业务规则、权限判断和事务流程，Store 执行查询及写入。处理好友申请时，带条件的更新只接受当前接收人对待处理申请的操作。
+- `social.Service` 和 `chat.Service` 负责业务规则、权限判断和事务流程，Store 执行查询及写入。好友关系查询由 `social.Store` 提供，`app` 将其作为 `chat.FriendshipChecker` 注入。群管理通过 `chat.Store` 读写共用的会话和成员表。处理好友申请时，带条件的更新只接受当前接收人对待处理申请的操作。
 - 创建单聊和发送新的单聊消息时检查好友状态。发送使用普通查询读取好友关系，以检查时的状态为准；会话行锁继续负责分配消息序号。群聊发送和成员变更共用会话行锁，确保成员资格变更和消息序号使用同一顺序。
 - HTTP 发送在 MySQL 提交后返回确认。文字、图片和红包通知均使用 Outbox。当前打开的会话每隔 25–35 秒通过 `GET /api/v1/conversations/:id/sync-state` 检查 `last_seq`，发现遗漏后按连续游标补拉。
 
 ## 红包通知与退款
 
+- 积分余额由 `user` 模块管理。注册时写入 1,000 积分和首笔流水；发红包、领取和退款通过 `user.ApplyPointChange` 在调用方事务内更新余额、写入流水。
 - 红包卡片按 `kind=red_packet` 和 `red_packet_id` 渲染。HTTP 与 WebSocket 的消息结构一致。余额不足使用 `40012`，领完使用 `40013`，到期使用 `40014`。
 - 创建、领取、退款在 MySQL 事务内写入 Outbox。发布器收到提交信号后扫描待发送记录，并每秒检查未发布记录；每批最多 50 条，最多同时发送 8 条。事件 ID 用作 RocketMQ 消息键。收到成功确认后记录发布时间，发布失败按最多 60 秒的退避间隔重试。
 - 领取红包时，在同一事务内增加一条 `kind=red_packet_claim` 的会话消息、推进会话序号并写入 Outbox。单聊中领取者看到「你领取了红包」，发送者看到「对方领取了你的红包」；群聊成员看到领取者昵称和领取状态。

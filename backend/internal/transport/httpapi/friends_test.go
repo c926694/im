@@ -7,8 +7,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/c926694/im/backend/internal/chat"
-	"github.com/c926694/im/backend/internal/friendship"
 	"github.com/c926694/im/backend/internal/platform/mysql"
 	"github.com/c926694/im/backend/internal/realtime"
 	"github.com/c926694/im/backend/internal/user"
@@ -25,7 +23,8 @@ func TestFriendRequestsMySQL(t *testing.T) {
 	}
 	t.Cleanup(func() { db.Close() })
 	hub := realtime.NewHub()
-	server := testServer(t, NewRouter(user.NewStore(db), chat.NewService(chat.NewStore(db)), friendship.NewService(friendship.NewStore(db)), hub, testSecret, nil, nil), hub)
+	chats, socialService := newTestServices(db, t.TempDir())
+	server := testServer(t, NewRouter(user.NewStore(db), chats, socialService, hub, testSecret, t.TempDir()), hub)
 	alice := registerAndLogin(t, server, "alice", "alice-password")
 	bob := registerAndLogin(t, server, "bob", "bob-password")
 	out := registerAndLogin(t, server, "outsider", "other-password")
@@ -72,17 +71,17 @@ func TestFriendRequestsMySQL(t *testing.T) {
 
 	directPath := "/api/v1/conversations/direct"
 	request(t, server, http.MethodPost, directPath, alice.Token, apply, http.StatusForbidden, nil)
-	request(t, server, http.MethodPatch, path+"/"+first.ID, alice.Token, accept, http.StatusNotFound, nil)
-	request(t, server, http.MethodPatch, path+"/"+first.ID, out.Token, accept, http.StatusNotFound, nil)
-	request(t, server, http.MethodPatch, path+"/"+first.ID, bob.Token, reject, http.StatusOK, nil)
+	request(t, server, http.MethodPut, path+"/"+first.ID, alice.Token, accept, http.StatusNotFound, nil)
+	request(t, server, http.MethodPut, path+"/"+first.ID, out.Token, accept, http.StatusNotFound, nil)
+	request(t, server, http.MethodPut, path+"/"+first.ID, bob.Token, reject, http.StatusOK, nil)
 	request(t, server, http.MethodPost, directPath, alice.Token, apply, http.StatusForbidden, nil)
 	request(t, server, http.MethodPost, path, alice.Token, apply, http.StatusOK, &next)
 	if next.ID == first.ID {
 		t.Fatal("reapplied with the old request ID")
 	}
-	request(t, server, http.MethodPatch, path+"/"+first.ID, bob.Token, accept, http.StatusNotFound, nil)
-	request(t, server, http.MethodPatch, path+"/"+next.ID, bob.Token, accept, http.StatusOK, nil)
-	request(t, server, http.MethodPatch, path+"/"+next.ID, bob.Token, reject, http.StatusNotFound, nil)
+	request(t, server, http.MethodPut, path+"/"+first.ID, bob.Token, accept, http.StatusNotFound, nil)
+	request(t, server, http.MethodPut, path+"/"+next.ID, bob.Token, accept, http.StatusOK, nil)
+	request(t, server, http.MethodPut, path+"/"+next.ID, bob.Token, reject, http.StatusNotFound, nil)
 	request(t, server, http.MethodPost, path, alice.Token, apply, http.StatusConflict, nil)
 	request(t, server, http.MethodGet, path, bob.Token, nil, http.StatusOK, &list)
 	if len(list) != 0 {

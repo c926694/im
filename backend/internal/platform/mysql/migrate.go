@@ -132,6 +132,12 @@ func applyMigration(ctx context.Context, conn *sqlx.Conn, file migrationFile) er
 	if _, err := conn.ExecContext(ctx, file.content); err != nil {
 		return fmt.Errorf("execute migration %s: %w", file.name, err)
 	}
+	if file.version == "000012" {
+		// 逐批复制余额，全部核对通过后才能继续执行删除旧账户表的迁移。
+		if err := copyPointBalances(ctx, conn); err != nil {
+			return fmt.Errorf("copy point balances: %w", err)
+		}
+	}
 	if _, err := conn.ExecContext(ctx, `UPDATE schema_migrations SET dirty = FALSE, applied_at = UTC_TIMESTAMP(6) WHERE version = ?`, file.version); err != nil {
 		return fmt.Errorf("complete migration %s: %w", file.version, err)
 	}

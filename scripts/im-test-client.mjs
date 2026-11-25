@@ -29,7 +29,7 @@ export function testClient(base) {
 
   async function befriend(sender, receiver) {
     const { id } = await api("/friend-requests", sender.token, { peer_username: receiver.username });
-    await api(`/friend-requests/${id}`, receiver.token, { status: "accepted" }, "PATCH");
+    await api(`/friend-requests/${id}`, receiver.token, { status: "accepted" }, "PUT");
   }
 
   async function connect(receiver, onMessage) {

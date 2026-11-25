@@ -5,38 +5,31 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"os"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/c926694/im/backend/internal/chat"
-	"github.com/c926694/im/backend/internal/friendship"
-	"github.com/c926694/im/backend/internal/points"
 	"github.com/c926694/im/backend/internal/realtime"
-	"github.com/c926694/im/backend/internal/redpacket"
+	"github.com/c926694/im/backend/internal/social"
 	"github.com/c926694/im/backend/internal/user"
 )
 
 type handler struct {
 	avatarDir  string
 	imageSlots chan struct{}
-	points     *points.Store
-	redPackets *redpacket.Service
 	users      *user.Store
 	chat       *chat.Service
-	friends    *friendship.Service
+	social     *social.Service
 	hub        *realtime.Hub
 	jwtSecret  []byte
 	tickets    ticketStore
 }
 
-func NewRouter(users *user.Store, chatService *chat.Service, friends *friendship.Service, hub *realtime.Hub, jwtSecret []byte, pointStore *points.Store, redPackets *redpacket.Service) *gin.Engine {
-	h := &handler{imageSlots: make(chan struct{}, 4), users: users, chat: chatService, friends: friends, hub: hub, jwtSecret: jwtSecret, points: pointStore, redPackets: redPackets}
-	h.avatarDir = os.Getenv("IM_AVATAR_DIR")
-	if h.avatarDir == "" {
-		h.avatarDir = "avatars"
-	}
+func NewRouter(users *user.Store, chatService *chat.Service, socialService *social.Service, hub *realtime.Hub,
+	jwtSecret []byte, avatarDir string) *gin.Engine {
+	h := &handler{avatarDir: avatarDir, imageSlots: make(chan struct{}, 4), users: users, chat: chatService,
+		social: socialService, hub: hub, jwtSecret: jwtSecret}
 	router := gin.New()
 	router.GET("/avatars/:name", h.serveAvatar)
 	// /ws 的查询参数里有票据，不能使用会打印原始请求的日志或 Recovery。
@@ -54,7 +47,6 @@ func NewRouter(users *user.Store, chatService *chat.Service, friends *friendship
 	router.GET("/healthz", func(c *gin.Context) {
 		respondSuccess(c, gin.H{"status": "ok"})
 	})
-	router.GET("/ws", h.openWebSocket)
 
 	api := router.Group("/api/v1")
 	api.Use(func(c *gin.Context) {
@@ -63,40 +55,12 @@ func NewRouter(users *user.Store, chatService *chat.Service, friends *friendship
 		c.Request = c.Request.WithContext(ctx)
 		c.Next()
 	})
-	api.POST("/auth/register", h.register)
-	api.POST("/auth/login", h.login)
-
+	h.registerAuthRoutes(api)
 	protected := api.Group("", h.requireBearer)
-	protected.GET("/me", h.me)
-	protected.PATCH("/me/avatar", h.uploadAvatar)
-	protected.POST("/ws/tickets", h.issueWSTicket)
-	protected.GET("/users/by-username", h.lookupUser)
-	protected.GET("/friends", h.listFriends)
-	protected.DELETE("/friends/:id", h.removeFriend)
-	protected.GET("/friend-requests", h.listFriendRequests)
-	protected.POST("/friend-requests", h.requestFriend)
-	protected.PATCH("/friend-requests/:id", h.resolveFriendRequest)
-	protected.POST("/conversations/direct", h.createDirect)
-	protected.GET("/conversations", h.listConversations)
-	protected.GET("/conversations/versions", h.listConversationVersions)
-	protected.POST("/conversations/:id/messages", h.sendMessage)
-	protected.GET("/messages/:id/image", h.readImage)
-	protected.GET("/conversations/:id/messages", h.listMessages)
-	protected.GET("/conversations/:id/sync-state", h.getSyncState)
-	protected.POST("/conversations/:id/read", h.markRead)
-	protected.GET("/points/balance", h.pointBalance)
-	protected.GET("/points/ledger", h.pointLedger)
-	protected.POST("/conversations/:id/red-packets", h.sendPacket)
-	protected.GET("/red-packets/:id", h.packetDetails)
-	protected.POST("/red-packets/:id/claim", h.claimPacket)
-	protected.POST("/groups", h.createGroup)
-	protected.GET("/groups/:id", h.groupDetails)
-	protected.PATCH("/groups/:id", h.renameGroup)
-	protected.POST("/groups/:id/members", h.inviteGroupMembers)
-	protected.DELETE("/groups/:id/members/:user_id", h.removeGroupMember)
-	protected.PATCH("/groups/:id/members/:user_id", h.setGroupRole)
-	protected.POST("/groups/:id/transfer", h.transferGroup)
-	protected.POST("/groups/:id/leave", h.leaveGroup)
+	h.registerUserRoutes(protected)
+	h.registerChatRoutes(protected)
+	h.registerSocialRoutes(protected)
+	h.registerRealtimeRoutes(router, protected)
 	return router
 }
 

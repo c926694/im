@@ -9,18 +9,18 @@ import (
 	"github.com/c926694/im/backend/internal/chat"
 	"github.com/c926694/im/backend/internal/outbox"
 	"github.com/c926694/im/backend/internal/realtime"
-	"github.com/c926694/im/backend/internal/redpacket"
+	"github.com/c926694/im/backend/internal/social"
 	"github.com/c926694/im/backend/internal/user"
 )
 
 type Notifier struct {
 	chat       *chat.Service
-	redPackets *redpacket.Service
+	redPackets *social.Service
 	users      *user.Store
 	hub        *realtime.Hub
 }
 
-func New(chats *chat.Service, packets *redpacket.Service, users *user.Store, hub *realtime.Hub) Notifier {
+func New(chats *chat.Service, packets *social.Service, users *user.Store, hub *realtime.Hub) Notifier {
 	return Notifier{chat: chats, redPackets: packets, users: users, hub: hub}
 }
 

@@ -1,0 +1,18 @@
+http:
+  addr: "0.0.0.0:8080"
+  mode: "release"
+
+mysql:
+  # 用户名、密码和库名与 Compose 中的 MySQL 一致。
+  dsn: "im_dev:im-local-app-example@tcp(mysql:3306)/im"
+
+auth:
+  jwt_secret: "" # 用 openssl rand -hex 32 生成密钥
+
+rocketmq:
+  nameserver: "rocketmq-namesrv:9876"
+  proxy: "rocketmq-broker:8081"
+
+storage:
+  avatar_dir: "/var/lib/im/avatars"
+  chat_image_dir: "/var/lib/im/chat-images"

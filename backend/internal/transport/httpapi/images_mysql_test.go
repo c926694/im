@@ -15,7 +15,6 @@ import (
 	"testing"
 
 	"github.com/c926694/im/backend/internal/chat"
-	"github.com/c926694/im/backend/internal/friendship"
 	"github.com/c926694/im/backend/internal/platform/mysql"
 	"github.com/c926694/im/backend/internal/realtime"
 	"github.com/c926694/im/backend/internal/user"
@@ -32,12 +31,11 @@ func TestChatImagesMySQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	t.Setenv("IM_CHAT_IMAGE_DIR", t.TempDir())
+	imageDir := t.TempDir()
 	hub := realtime.NewHub()
-	chats := chat.NewService(chat.NewStore(db))
-	startNotifications(t, db, chats, hub)
-	server := testServer(t, NewRouter(user.NewStore(db), chats,
-		friendship.NewService(friendship.NewStore(db)), hub, testSecret, nil, nil), hub)
+	chats, socialService := newTestServices(db, imageDir)
+	startNotifications(t, db, chats, socialService, hub)
+	server := testServer(t, NewRouter(user.NewStore(db), chats, socialService, hub, testSecret, t.TempDir()), hub)
 	alice := registerAndLogin(t, server, "image_alice", "")
 	bob := registerAndLogin(t, server, "image_bob", "")
 	carol := registerAndLogin(t, server, "image_carol", "")
@@ -161,10 +159,10 @@ func TestChatImagesMySQL(t *testing.T) {
 	if _, err := db.Exec(`UPDATE messages SET image_path = NULL WHERE id = ?`, message.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := chat.MigrateImageFiles(context.Background(), db, chat.ImageDirectory()); err != nil {
+	if err := chat.MigrateImageFiles(context.Background(), db, imageDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := chat.MigrateImageFiles(context.Background(), db, chat.ImageDirectory()); err != nil {
+	if err := chat.MigrateImageFiles(context.Background(), db, imageDir); err != nil {
 		t.Fatal(err)
 	}
 	read(bob.Token, message)

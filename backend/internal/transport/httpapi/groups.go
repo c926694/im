@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"errors"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/c926694/im/backend/internal/chat"
 	"github.com/c926694/im/backend/internal/realtime"
+	"github.com/c926694/im/backend/internal/social"
 	"github.com/c926694/im/backend/internal/user"
 )
 
@@ -40,7 +42,7 @@ func (h *handler) createGroup(c *gin.Context) {
 		reject(c, "invalid_group")
 		return
 	}
-	change, err := h.chat.CreateGroup(c.Request.Context(), actor, name, ids)
+	change, err := h.social.CreateGroup(c.Request.Context(), actor, name, ids)
 	h.respondGroupChange(c, change, err)
 }
 
@@ -50,9 +52,9 @@ func (h *handler) groupDetails(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	details, err := h.chat.GroupDetails(ctx, authenticated(c).userID, id)
+	details, err := h.social.GroupDetails(ctx, authenticated(c).userID, id)
 	if err != nil {
-		chatError(c, err)
+		groupError(c, err)
 		return
 	}
 	// 群成员查询返回用户 ID，再一次读取成员资料。
@@ -89,7 +91,7 @@ func (h *handler) renameGroup(c *gin.Context) {
 		reject(c, "invalid_group")
 		return
 	}
-	change, err := h.chat.RenameGroup(c.Request.Context(), authenticated(c).userID, id, name)
+	change, err := h.social.RenameGroup(c.Request.Context(), authenticated(c).userID, id, name)
 	h.respondGroupChange(c, change, err)
 }
 
@@ -111,7 +113,7 @@ func (h *handler) inviteGroupMembers(c *gin.Context) {
 		reject(c, "invalid_group")
 		return
 	}
-	change, err := h.chat.InviteMembers(c.Request.Context(), actor, id, ids)
+	change, err := h.social.InviteMembers(c.Request.Context(), actor, id, ids)
 	h.respondGroupChange(c, change, err)
 }
 
@@ -124,7 +126,7 @@ func (h *handler) removeGroupMember(c *gin.Context) {
 	if !ok {
 		return
 	}
-	change, err := h.chat.RemoveGroupMember(c.Request.Context(), authenticated(c).userID, id, target)
+	change, err := h.social.RemoveGroupMember(c.Request.Context(), authenticated(c).userID, id, target)
 	h.respondGroupChange(c, change, err)
 }
 
@@ -144,7 +146,7 @@ func (h *handler) setGroupRole(c *gin.Context) {
 		reject(c, "invalid_group")
 		return
 	}
-	change, err := h.chat.SetGroupRole(c.Request.Context(), authenticated(c).userID, id, target, form.Role)
+	change, err := h.social.SetGroupRole(c.Request.Context(), authenticated(c).userID, id, target, form.Role)
 	h.respondGroupChange(c, change, err)
 }
 
@@ -160,7 +162,7 @@ func (h *handler) transferGroup(c *gin.Context) {
 		reject(c, "invalid_group")
 		return
 	}
-	change, err := h.chat.TransferGroup(c.Request.Context(), authenticated(c).userID, id, form.UserID)
+	change, err := h.social.TransferGroup(c.Request.Context(), authenticated(c).userID, id, form.UserID)
 	h.respondGroupChange(c, change, err)
 }
 
@@ -169,20 +171,39 @@ func (h *handler) leaveGroup(c *gin.Context) {
 	if !ok {
 		return
 	}
-	change, err := h.chat.LeaveGroup(c.Request.Context(), authenticated(c).userID, id)
+	change, err := h.social.LeaveGroup(c.Request.Context(), authenticated(c).userID, id)
 	h.respondGroupChange(c, change, err)
 }
 
 // respondGroupChange 在事务提交后通知受影响的成员重新查询会话。
-func (h *handler) respondGroupChange(c *gin.Context, change chat.GroupChange, err error) {
+func (h *handler) respondGroupChange(c *gin.Context, change social.GroupChange, err error) {
 	if err != nil {
-		chatError(c, err)
+		groupError(c, err)
 		return
 	}
 	if err := h.hub.PushConversationUpdated(change.Recipients, realtime.ConversationUpdated{ConversationID: change.ID}); err != nil {
 		slog.Warn("group change saved but push failed", "conversation_id", change.ID, "error", err)
 	}
 	respondSuccess(c, gin.H{"id": strconv.FormatInt(change.ID, 10)})
+}
+
+func groupError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, social.ErrGroupUnavailable):
+		reject(c, "group_unavailable")
+	case errors.Is(err, social.ErrGroupPermission):
+		reject(c, "group_permission")
+	case errors.Is(err, social.ErrGroupMemberMissing):
+		reject(c, "group_member_missing")
+	case errors.Is(err, social.ErrGroupLimit):
+		reject(c, "group_limit")
+	case errors.Is(err, social.ErrGroupInviteFriends):
+		reject(c, "group_invite_friends")
+	case errors.Is(err, social.ErrOwnerMustTransfer):
+		reject(c, "owner_must_transfer")
+	default:
+		chatError(c, err)
+	}
 }
 
 func groupName(value string) (string, bool) {

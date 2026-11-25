@@ -12,7 +12,7 @@ import (
 	"github.com/c926694/im/backend/internal/notify"
 	"github.com/c926694/im/backend/internal/outbox"
 	"github.com/c926694/im/backend/internal/platform/rocketmq"
-	"github.com/c926694/im/backend/internal/redpacket"
+	"github.com/c926694/im/backend/internal/social"
 )
 
 const (
@@ -47,7 +47,7 @@ type messagingTasks struct {
 	endpoint   string
 	events     *outbox.Store
 	notifier   notify.Notifier
-	packets    *redpacket.Service
+	packets    *social.Service
 }
 
 // Start 分别启动发布和消费；单个 Topic 暂不可用时不阻止其他任务。
@@ -145,7 +145,7 @@ func consumeBatch(ctx context.Context, consumer *rocketmq.PullConsumer, limit in
 
 type refundHandler struct {
 	consumer *rocketmq.PullConsumer
-	packets  *redpacket.Service
+	packets  *social.Service
 }
 
 func (h refundHandler) refundAndAck(ctx context.Context, message rocketmq.Delivery) error {

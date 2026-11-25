@@ -1,0 +1,18 @@
+http:
+  addr: "127.0.0.1:8080"
+  mode: "debug"
+
+mysql:
+  dsn: "im_dev:im-local-app-example@tcp(127.0.0.1:3306)/im"
+
+auth:
+  jwt_secret: "" # 用 openssl rand -hex 32 生成密钥
+
+rocketmq:
+  nameserver: "127.0.0.1:9876"
+  proxy: "127.0.0.1:8081"
+
+# 相对路径以启动命令的工作目录为准。
+storage:
+  avatar_dir: "avatars"
+  chat_image_dir: "chat-images"

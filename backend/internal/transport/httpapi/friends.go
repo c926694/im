@@ -7,7 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/c926694/im/backend/internal/friendship"
+	"github.com/c926694/im/backend/internal/social"
 	"github.com/c926694/im/backend/internal/user"
 )
 
@@ -52,7 +52,7 @@ func (h *handler) requestFriend(c *gin.Context) {
 		return
 	}
 	// 申请人来自登录身份，重复申请沿用已有的申请标识。
-	entry, err := h.friends.Request(ctx, authenticated(c).userID, peer.ID)
+	entry, err := h.social.Request(ctx, authenticated(c).userID, peer.ID)
 	if err != nil {
 		friendError(c, err)
 		return
@@ -61,7 +61,7 @@ func (h *handler) requestFriend(c *gin.Context) {
 }
 
 func (h *handler) listFriends(c *gin.Context) {
-	entries, profiles, err := h.friendProfiles(c, friendship.Accepted)
+	entries, profiles, err := h.friendProfiles(c, social.Accepted)
 	if err != nil {
 		internalError(c, err)
 		return
@@ -78,7 +78,7 @@ func (h *handler) listFriends(c *gin.Context) {
 }
 
 func (h *handler) listFriendRequests(c *gin.Context) {
-	entries, profiles, err := h.friendProfiles(c, friendship.Pending)
+	entries, profiles, err := h.friendProfiles(c, social.Pending)
 	if err != nil {
 		internalError(c, err)
 		return
@@ -95,10 +95,10 @@ func (h *handler) listFriendRequests(c *gin.Context) {
 	respondSuccess(c, response)
 }
 
-func (h *handler) friendProfiles(c *gin.Context, status friendship.Status) ([]friendship.Relationship, map[int64]user.Profile, error) {
+func (h *handler) friendProfiles(c *gin.Context, status social.FriendshipStatus) ([]social.Relationship, map[int64]user.Profile, error) {
 	ctx := c.Request.Context()
 	// 先查询当前用户的关系，再按关系中的用户 ID 批量查询昵称和用户名。
-	entries, err := h.friends.List(ctx, authenticated(c).userID, status)
+	entries, err := h.social.List(ctx, authenticated(c).userID, status)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -112,9 +112,9 @@ func (h *handler) friendProfiles(c *gin.Context, status friendship.Status) ([]fr
 
 func (h *handler) resolveFriendRequest(c *gin.Context) {
 	var form struct {
-		Status friendship.Status `json:"status"`
+		Status social.FriendshipStatus `json:"status"`
 	}
-	if err := c.ShouldBindJSON(&form); err != nil || (form.Status != friendship.Accepted && form.Status != friendship.Rejected) {
+	if err := c.ShouldBindJSON(&form); err != nil || (form.Status != social.Accepted && form.Status != social.Rejected) {
 		reject(c, "invalid_friend_decision")
 		return
 	}
@@ -124,7 +124,7 @@ func (h *handler) resolveFriendRequest(c *gin.Context) {
 		return
 	}
 	// 按申请标识处理当前用户收到的待办，防止旧申请改变新关系。
-	if err := h.friends.Resolve(c.Request.Context(), authenticated(c).userID, id, form.Status); err != nil {
+	if err := h.social.Resolve(c.Request.Context(), authenticated(c).userID, id, form.Status); err != nil {
 		friendError(c, err)
 		return
 	}
@@ -138,24 +138,24 @@ func (h *handler) removeFriend(c *gin.Context) {
 		return
 	}
 	// 解除好友只修改关系，旧会话和消息继续可查。
-	if err := h.friends.Remove(c.Request.Context(), authenticated(c).userID, peerID); err != nil {
+	if err := h.social.Remove(c.Request.Context(), authenticated(c).userID, peerID); err != nil {
 		friendError(c, err)
 		return
 	}
-	respondSuccess(c, gin.H{"status": friendship.Removed})
+	respondSuccess(c, gin.H{"status": social.Removed})
 }
 
 func friendError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, user.ErrUserNotFound):
 		reject(c, "user_not_found")
-	case errors.Is(err, friendship.ErrSelfRequest):
+	case errors.Is(err, social.ErrSelfRequest):
 		reject(c, "self_friend_request")
-	case errors.Is(err, friendship.ErrIncomingRequest):
+	case errors.Is(err, social.ErrIncomingRequest):
 		reject(c, "incoming_friend_request")
-	case errors.Is(err, friendship.ErrAlreadyFriends):
+	case errors.Is(err, social.ErrAlreadyFriends):
 		reject(c, "already_friends")
-	case errors.Is(err, friendship.ErrRequestUnavailable):
+	case errors.Is(err, social.ErrRequestUnavailable):
 		reject(c, "friend_request_unavailable")
 	default:
 		internalError(c, err)

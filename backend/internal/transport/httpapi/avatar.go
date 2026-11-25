@@ -67,12 +67,14 @@ func (h *handler) uploadAvatar(c *gin.Context) {
 		internalError(c, err)
 		return
 	}
-	if err := h.users.SetAvatar(c.Request.Context(), authenticated(c).userID, name); err != nil {
+	avatarURL := "/avatars/" + name
+	// 保存访问路径后，用户资料接口可直接返回相同的 URL。
+	if err := h.users.SetAvatar(c.Request.Context(), authenticated(c).userID, avatarURL); err != nil {
 		_ = os.Remove(path)
 		internalError(c, err)
 		return
 	}
-	respondSuccess(c, gin.H{"avatar_url": "/avatars/" + name})
+	respondSuccess(c, gin.H{"avatar_url": avatarURL})
 }
 
 func (h *handler) serveAvatar(c *gin.Context) {

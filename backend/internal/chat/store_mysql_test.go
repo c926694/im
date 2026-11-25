@@ -15,8 +15,8 @@ import (
 	"github.com/jmoiron/sqlx"
 
 	"github.com/c926694/im/backend/internal/chat"
-	"github.com/c926694/im/backend/internal/friendship"
 	"github.com/c926694/im/backend/internal/platform/mysql"
+	"github.com/c926694/im/backend/internal/social"
 )
 
 func TestStoreMySQL(t *testing.T) {
@@ -35,12 +35,14 @@ func TestStoreMySQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	alice, bob, outsider := insertUser(t, ctx, db), insertUser(t, ctx, db), insertUser(t, ctx, db)
-	store := chat.NewService(chat.NewStore(db))
-	friends := friendship.NewService(friendship.NewStore(db))
+	chatStore := chat.NewStore(db)
+	socialStore := social.NewStore(db)
+	store := chat.NewService(chatStore, socialStore, t.TempDir())
+	friends := social.NewService(socialStore, store, chatStore)
 	if _, err := store.CreateDirect(ctx, alice, 1<<62); !errors.Is(err, chat.ErrUserNotFound) {
 		t.Fatalf("open with unknown user error = %v", err)
 	}
-	var requests [8]friendship.Relationship
+	var requests [8]social.Relationship
 	runConcurrently(t, len(requests), func(i int) error {
 		entry, err := friends.Request(ctx, alice, bob)
 		requests[i] = entry
@@ -53,8 +55,8 @@ func TestStoreMySQL(t *testing.T) {
 	}
 	var resolved [8]bool
 	runConcurrently(t, len(resolved), func(i int) error {
-		err := friends.Resolve(ctx, bob, requests[0].RequestID, friendship.Accepted)
-		if errors.Is(err, friendship.ErrRequestUnavailable) {
+		err := friends.Resolve(ctx, bob, requests[0].RequestID, social.Accepted)
+		if errors.Is(err, social.ErrRequestUnavailable) {
 			return nil
 		}
 		resolved[i] = err == nil
@@ -73,7 +75,7 @@ func TestStoreMySQL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := friends.Resolve(ctx, outsider, entry.RequestID, friendship.Accepted); err != nil {
+	if err := friends.Resolve(ctx, outsider, entry.RequestID, social.Accepted); err != nil {
 		t.Fatal(err)
 	}
 

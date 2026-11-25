@@ -75,6 +75,10 @@ export type PointEntry = {
 export type Draft = { client_msg_id: string; content: string };
 type Credentials = { username: string; password: string };
 
+type APIRequestOptions = Omit<RequestInit, "method"> & {
+  method?: "GET" | "PUT" | "POST" | "DELETE";
+};
+
 type APIResponse<T> = {
   code: number;
   msg: string;
@@ -93,7 +97,7 @@ export class APIError extends Error {
   }
 }
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+async function request<T>(path: string, options: APIRequestOptions = {}): Promise<T> {
   const headers = new Headers(options.headers);
   if (options.body && !(options.body instanceof FormData)) headers.set("Content-Type", "application/json");
 
@@ -134,7 +138,7 @@ export async function login(form: Credentials): Promise<Session> {
 export const pageSize = 50;
 
 export function chatAPI(session: Session, onExpired: () => void) {
-  async function authorized<T>(path: string, options?: RequestInit) {
+  async function authorized<T>(path: string, options?: APIRequestOptions) {
     try {
       return await request<T>(path, {
         ...options,
@@ -151,7 +155,7 @@ export function chatAPI(session: Session, onExpired: () => void) {
     uploadAvatar: (file: File) => {
       const body = new FormData();
       body.set("avatar", file);
-      return authorized<{ avatar_url: string }>("/me/avatar", { method: "PATCH", body });
+      return authorized<{ avatar_url: string }>("/me/avatar", { method: "PUT", body });
     },
     lookupUser: (username: string) => authorized<Profile>(`/users/by-username?${new URLSearchParams({ username })}`),
     friends: (signal: AbortSignal) => authorized<Profile[]>("/friends", { signal }),
@@ -160,7 +164,7 @@ export function chatAPI(session: Session, onExpired: () => void) {
       method: "POST", body: JSON.stringify({ peer_username: username }),
     }),
     resolveFriend: (id: string, status: "accepted" | "rejected") => authorized<{ status: string }>(`/friend-requests/${id}`, {
-      method: "PATCH", body: JSON.stringify({ status }),
+      method: "PUT", body: JSON.stringify({ status }),
     }),
     removeFriend: (id: string) => authorized<{ status: string }>(`/friends/${id}`, { method: "DELETE" }),
     conversations: (signal?: AbortSignal, ids?: string[]) =>
@@ -176,14 +180,14 @@ export function chatAPI(session: Session, onExpired: () => void) {
     }),
     groupDetails: (id: string, signal: AbortSignal) => authorized<Group>(`/groups/${id}`, { signal }),
     renameGroup: (id: string, name: string) => authorized<{ id: string }>(`/groups/${id}`, {
-      method: "PATCH", body: JSON.stringify({ name }),
+      method: "PUT", body: JSON.stringify({ name }),
     }),
     inviteGroupMembers: (id: string, memberIDs: string[]) => authorized<{ id: string }>(`/groups/${id}/members`, {
       method: "POST", body: JSON.stringify({ member_ids: memberIDs }),
     }),
     removeGroupMember: (id: string, userID: string) => authorized<{ id: string }>(`/groups/${id}/members/${userID}`, { method: "DELETE" }),
     setGroupRole: (id: string, userID: string, role: "admin" | "member") => authorized<{ id: string }>(`/groups/${id}/members/${userID}`, {
-      method: "PATCH", body: JSON.stringify({ role }),
+      method: "PUT", body: JSON.stringify({ role }),
     }),
     transferGroup: (id: string, userID: string) => authorized<{ id: string }>(`/groups/${id}/transfer`, {
       method: "POST", body: JSON.stringify({ user_id: userID }),

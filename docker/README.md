@@ -1,13 +1,28 @@
 # Docker Compose 本地运行
 
-在仓库根目录执行。复制配置和生成签名密钥只需要执行一次；保留已有的 `docker/.env`。
+在仓库根目录执行。首次部署时创建本地配置，已有配置文件可以继续使用。
 
 ```sh
 umask 077
 cp docker/.env.example docker/.env
-printf "\nIM_JWT_SECRET=%s\n" "$(openssl rand -hex 32)" >> docker/.env
+mkdir -p -m 700 docker/config
+cp docker/backend.example.yaml docker/config/backend.yaml
+chmod 644 docker/config/backend.yaml
+openssl rand -hex 32
+```
+
+将生成的密钥填入 `docker/config/backend.yaml` 的 `auth.jwt_secret`。如需继续使用已有的登录凭证，将原来使用的 JWT 密钥填入此处。保持 `mysql.dsn` 中的账号、密码和库名与 MySQL 一致。Compose 把 YAML 只读挂载到 `/etc/im/configs/config.yaml`；文件由容器内非 root 用户读取，宿主机通过 `docker/config` 目录权限限制访问。`docker/.env` 管理 MySQL 初始化账号、宿主机端口和构建选项。
+
+```sh
 docker compose --env-file docker/.env -f docker/compose.yaml up -d --build --wait
 docker compose --env-file docker/.env -f docker/compose.yaml ps
+```
+
+修改 YAML 后重新创建后端容器以读取文件，并重启前端以刷新 Nginx 的上游地址。无需重新构建镜像：
+
+```sh
+docker compose --env-file docker/.env -f docker/compose.yaml up -d --no-deps --force-recreate --wait backend
+docker compose --env-file docker/.env -f docker/compose.yaml restart --no-deps frontend
 ```
 
 | 服务 | 用途与访问地址 |
@@ -20,7 +35,7 @@ docker compose --env-file docker/.env -f docker/compose.yaml ps
 
 聊天图片保存在 `chat-image-data` 数据卷，Gin 按消息 ID 校验权限后提供读取。备份时同时保存 MySQL 和该数据卷。升级至 `000009` 时，后端启动会复制历史图片到数据卷并保存相对路径，成功后删除旧图片数据表。
 
-头像由 Gin 提供 `/avatars/`，Nginx 将同源图片请求转发给后端。后端通过 `IM_AVATAR_DIR` 使用 `avatar-data` 数据卷保存上传图片；默认头像随程序提供。
+头像由 Gin 提供 `/avatars/`，Nginx 将同源图片请求转发给后端。`users.avatar_url` 保存相对访问路径，默认值为 `/avatars/default.webp`。YAML 中的 `storage.avatar_dir` 和 `storage.chat_image_dir` 对应容器内的数据卷挂载目录；默认头像随程序提供。
 
 MySQL 表结构由后端迁移程序管理。`backend/migrations/NNNNNN_*.up.sql` 会随 Go 程序编译进后端镜像。程序启动时读取 `schema_migrations`，按版本顺序执行尚未记录的文件；成功版本不会重复执行。增加迁移文件后，需要重新构建并启动后端：
 
@@ -29,6 +44,10 @@ docker compose --env-file docker/.env -f docker/compose.yaml up -d --build backe
 ```
 
 空数据库首次启动时，后端会执行全部迁移。已有数据库会按当前表和字段识别已应用的版本，再执行剩余迁移。MySQL DDL 失败后，迁移记录会保留未完成状态，后端会停止启动；检查数据库后再处理，程序不会自动重跑未完成的 DDL。
+
+升级前备份 MySQL，停止旧版后端后再启动新版。从 `000011` 升级时，迁移 `000012` 将旧账户余额分批复制到 `users.point_balance`。确认旧账户均已复制且没有空余额后，`000013` 添加余额约束并删除 `point_accounts`。原有 `point_ledger` 流水继续保留。
+
+迁移 `000014` 将已有头像转换为相对 URL，保留原有头像数据卷和访问地址。备份头像时需同时保存 MySQL 和 `avatar-data`。
 
 浏览器打开前端页面后可以注册 IM 账号，并使用该账号登录。单聊和群聊均使用 MySQL 保存消息，文字、图片与红包通知通过 Outbox 和 RocketMQ 异步发布，再通过本地 WebSocket Hub 推送。
 
@@ -72,6 +91,10 @@ IM_MIGRATION_UPGRADE_TEST_DSN="im_dev:im-local-app-example@tcp(127.0.0.1:3306)/i
 IM_TEST_MYSQL_DSN="im_dev:im-local-app-example@tcp(127.0.0.1:3306)/im_test" \
   go test -race -count=1 ./...
 ```
+
+积分迁移测试使用空的独立数据库 `im_points_upgrade_test`。设置 `IM_POINTS_UPGRADE_TEST_DSN` 后运行 `go test -race -count=1 ./internal/platform/mysql -run TestMigrateMovesPointBalancesIntoUsers`，核对旧余额、流水及重复启动结果。
+
+头像迁移测试使用空的独立数据库 `im_avatar_upgrade_test`。设置 `IM_AVATAR_UPGRADE_TEST_DSN` 后运行 `go test -race -count=1 ./internal/platform/mysql -run TestMigrateStoresAvatarURLs`，核对默认头像和已上传头像的访问路径。
 
 ## 单实例压测与故障演练
 

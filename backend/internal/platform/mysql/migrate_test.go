@@ -3,6 +3,7 @@ package mysql
 import (
 	"context"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -62,7 +63,7 @@ func TestMigrateContinuesLegacySchema(t *testing.T) {
 	assertMigrationHistory(t, ctx, db)
 	if seededLegacyUser {
 		var balance int64
-		if err := db.GetContext(ctx, &balance, `SELECT balance FROM point_accounts WHERE user_id = (SELECT id FROM users WHERE username = ?)`, "migration_legacy"); err != nil {
+		if err := db.GetContext(ctx, &balance, `SELECT point_balance FROM users WHERE username = ?`, "migration_legacy"); err != nil {
 			t.Fatalf("read migrated legacy account balance: %v", err)
 		}
 		if balance != 1000 {
@@ -75,31 +76,8 @@ func TestMigrateSchedulesOpenPackets(t *testing.T) {
 	db := openMigrationTestDatabase(t, "IM_EXPIRY_UPGRADE_TEST_DSN", "im_expiry_upgrade_test")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	files, err := migrationFiles()
-	if err != nil {
-		t.Fatal(err)
-	}
-	conn, err := db.Connx(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := conn.ExecContext(ctx, createMigrationTable); err != nil {
-		conn.Close()
-		t.Fatal(err)
-	}
-	for _, file := range files {
-		if file.version > "000010" {
-			break
-		}
-		if err := applyMigration(ctx, conn, file); err != nil {
-			conn.Close()
-			t.Fatal(err)
-		}
-	}
-	if err := conn.Close(); err != nil {
-		t.Fatal(err)
-	}
-	_, err = db.ExecContext(ctx, `INSERT INTO red_packets (sender_id, points_per_share, share_count, remaining, status, expires_at)
+	applyMigrationsThrough(t, ctx, db, "000010")
+	_, err := db.ExecContext(ctx, `INSERT INTO red_packets (sender_id, points_per_share, share_count, remaining, status, expires_at)
 		VALUES (1, 10, 1, 1, 'open', UTC_TIMESTAMP(6) - INTERVAL 5 SECOND),
 		(1, 10, 1, 1, 'open', UTC_TIMESTAMP(6) + INTERVAL 12 HOUR),
 		(1, 10, 1, 0, 'claimed', UTC_TIMESTAMP(6))`)
@@ -117,6 +95,117 @@ func TestMigrateSchedulesOpenPackets(t *testing.T) {
 	}
 	if len(ids) != 2 || ids[0] != 1 || ids[1] != 2 {
 		t.Fatalf("expiry tasks: %v", ids)
+	}
+}
+
+func TestMigrateMovesPointBalancesIntoUsers(t *testing.T) {
+	db := openMigrationTestDatabase(t, "IM_POINTS_UPGRADE_TEST_DSN", "im_points_upgrade_test")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	applyMigrationsThrough(t, ctx, db, "000011")
+
+	// 使用迁移前的表结构构造一次已完成的红包交易，覆盖非默认余额和零余额。
+	if _, err := db.ExecContext(ctx, `INSERT INTO users (id, username, password_hash, nickname)
+		VALUES (11, 'points_sender', 'test-hash', '发红包用户'), (42, 'points_receiver', 'test-hash', '领红包用户');
+		INSERT INTO point_accounts (user_id, balance) VALUES (11, 0), (42, 2000);
+		INSERT INTO red_packets (id, sender_id, recipient_id, points_per_share, share_count, remaining, status, expires_at)
+		VALUES (15, 11, 42, 1000, 1, 0, 'claimed', UTC_TIMESTAMP(6));
+		INSERT INTO red_packet_claims (red_packet_id, user_id, points) VALUES (15, 42, 1000);
+		INSERT INTO point_ledger (user_id, kind, ref_id, delta, balance_after) VALUES
+			(11, 'grant', 11, 1000, 1000), (42, 'grant', 42, 1000, 1000),
+			(11, 'send', 15, -1000, 0), (42, 'claim', 15, 1000, 2000)`); err != nil {
+		t.Fatal(err)
+	}
+	type ledgerRow struct {
+		ID           int64     `db:"id"`
+		UserID       int64     `db:"user_id"`
+		Kind         string    `db:"kind"`
+		RefID        int64     `db:"ref_id"`
+		Delta        int64     `db:"delta"`
+		BalanceAfter int64     `db:"balance_after"`
+		CreatedAt    time.Time `db:"created_at"`
+	}
+	const ledgerSQL = `SELECT id, user_id, kind, ref_id, delta, balance_after, created_at FROM point_ledger ORDER BY id`
+	var before, after []ledgerRow
+	if err := db.SelectContext(ctx, &before, ledgerSQL); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := Migrate(ctx, db); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertMigrationHistory(t, ctx, db)
+	var balances []int64
+	if err := db.SelectContext(ctx, &balances, `SELECT point_balance FROM users ORDER BY id`); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(balances, []int64{0, 2000}) {
+		t.Fatalf("迁移后的积分余额不一致：%v", balances)
+	}
+	if err := db.SelectContext(ctx, &after, ledgerSQL); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(before, after) {
+		t.Fatalf("迁移后的流水发生变化：迁移前 %v，迁移后 %v", before, after)
+	}
+	var legacyExists bool
+	if err := db.GetContext(ctx, &legacyExists, `SELECT EXISTS(SELECT 1 FROM information_schema.tables
+		WHERE table_schema = DATABASE() AND table_name = 'point_accounts')`); err != nil {
+		t.Fatal(err)
+	}
+	if legacyExists {
+		t.Fatal("旧积分账户表仍然存在")
+	}
+}
+
+func applyMigrationsThrough(t *testing.T, ctx context.Context, db *sqlx.DB, version string) {
+	t.Helper()
+	files, err := migrationFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := db.Connx(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, createMigrationTable); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		if file.version > version {
+			break
+		}
+		if err := applyMigration(ctx, conn, file); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestMigrateStoresAvatarURLs(t *testing.T) {
+	db := openMigrationTestDatabase(t, "IM_AVATAR_UPGRADE_TEST_DSN", "im_avatar_upgrade_test")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	applyMigrationsThrough(t, ctx, db, "000013")
+
+	const filename = "ba8c0bef-5de6-4ae8-94d0-711ea808ea31.webp"
+	if _, err := db.ExecContext(ctx, `INSERT INTO users (username, password_hash, nickname, avatar_name)
+		VALUES ('avatar_default', 'test-hash', '默认头像', ''), ('avatar_uploaded', 'test-hash', '上传头像', ?)`, filename); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := Migrate(ctx, db); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertMigrationHistory(t, ctx, db)
+	var urls []string
+	if err := db.SelectContext(ctx, &urls, `SELECT avatar_url FROM users ORDER BY id`); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(urls, []string{"/avatars/default.webp", "/avatars/" + filename}) {
+		t.Fatalf("迁移后的头像 URL 不一致：%v", urls)
 	}
 }
 

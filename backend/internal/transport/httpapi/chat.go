@@ -12,9 +12,8 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/c926694/im/backend/internal/chat"
-	"github.com/c926694/im/backend/internal/friendship"
 	"github.com/c926694/im/backend/internal/realtime"
-	"github.com/c926694/im/backend/internal/redpacket"
+	"github.com/c926694/im/backend/internal/social"
 	"github.com/c926694/im/backend/internal/user"
 )
 
@@ -110,7 +109,7 @@ func (h *handler) listConversations(c *gin.Context) {
 	accepted := make(map[int64]bool)
 	if len(peerIDs) > 0 {
 		// 好友状态只控制发送入口，历史会话仍保留在列表中。
-		friends, err := h.friends.List(ctx, userID, friendship.Accepted)
+		friends, err := h.social.List(ctx, userID, social.Accepted)
 		if err != nil {
 			internalError(c, err)
 			return
@@ -252,9 +251,9 @@ func (h *handler) listMessages(c *gin.Context) {
 			packetIDs = append(packetIDs, *message.RedPacketID)
 		}
 	}
-	packetStatuses := make(map[int64]redpacket.Status)
+	packetStatuses := make(map[int64]social.RedPacketStatus)
 	if len(packetIDs) > 0 {
-		packetStatuses, err = h.redPackets.Statuses(ctx, packetIDs)
+		packetStatuses, err = h.social.Statuses(ctx, packetIDs)
 		if err != nil {
 			internalError(c, err)
 			return
@@ -348,7 +347,7 @@ func chatError(c *gin.Context, err error) {
 		reject(c, "user_not_found")
 	case errors.Is(err, chat.ErrNotMember):
 		reject(c, "not_conversation_member")
-	case errors.Is(err, friendship.ErrNotFriends):
+	case errors.Is(err, chat.ErrNotFriends):
 		reject(c, "not_friends")
 	case errors.Is(err, chat.ErrInvalidClientMsgID):
 		reject(c, "invalid_client_msg_id")
@@ -358,18 +357,6 @@ func chatError(c *gin.Context, err error) {
 		reject(c, "invalid_read_seq")
 	case errors.Is(err, chat.ErrInvalidPageSize):
 		reject(c, "invalid_pagination")
-	case errors.Is(err, chat.ErrGroupUnavailable):
-		reject(c, "group_unavailable")
-	case errors.Is(err, chat.ErrGroupPermission):
-		reject(c, "group_permission")
-	case errors.Is(err, chat.ErrGroupMemberMissing):
-		reject(c, "group_member_missing")
-	case errors.Is(err, chat.ErrGroupLimit):
-		reject(c, "group_limit")
-	case errors.Is(err, chat.ErrGroupInviteFriends):
-		reject(c, "group_invite_friends")
-	case errors.Is(err, chat.ErrOwnerMustTransfer):
-		reject(c, "owner_must_transfer")
 	case errors.Is(err, chat.ErrMessageConflict):
 		reject(c, "message_conflict")
 	case errors.Is(err, chat.ErrPreviousMembershipMessage):

@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"context"
-
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,11 +11,9 @@ import (
 	"testing"
 
 	"github.com/c926694/im/backend/internal/chat"
-	"github.com/c926694/im/backend/internal/friendship"
 	"github.com/c926694/im/backend/internal/platform/mysql"
-	"github.com/c926694/im/backend/internal/points"
 	"github.com/c926694/im/backend/internal/realtime"
-	"github.com/c926694/im/backend/internal/redpacket"
+	"github.com/c926694/im/backend/internal/social"
 	"github.com/c926694/im/backend/internal/user"
 )
 
@@ -35,20 +32,18 @@ func TestRedPacketsMySQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	chats := chat.NewService(chat.NewStore(db))
-	packets := redpacket.NewService(redpacket.NewStore(db), chats)
+	chats, packets := newTestServices(db, t.TempDir())
 	hub := realtime.NewHub()
-	server := testServer(t, NewRouter(user.NewStore(db), chats, friendship.NewService(friendship.NewStore(db)), hub,
-		testSecret, points.NewStore(db), packets), hub)
+	server := testServer(t, NewRouter(user.NewStore(db), chats, packets, hub, testSecret, t.TempDir()), hub)
 	alice := registerAndLogin(t, server, "packet_alice", "")
 	bob := registerAndLogin(t, server, "packet_bob", "")
 	carol := registerAndLogin(t, server, "packet_carol", "")
 	befriend(t, server, alice, bob)
 	befriend(t, server, alice, carol)
 	assertPoints(t, server, alice, "1000")
-	var ledger []points.Entry
+	var ledger []user.PointEntry
 	request(t, server, http.MethodGet, "/api/v1/points/ledger", alice.Token, nil, http.StatusOK, &ledger)
-	if len(ledger) != 1 || ledger[0].Kind != points.Grant || ledger[0].Delta != 1000 {
+	if len(ledger) != 1 || ledger[0].Kind != user.PointGrant || ledger[0].Delta != 1000 || ledger[0].BalanceAfter != 1000 {
 		t.Fatalf("initial ledger = %+v", ledger)
 	}
 
@@ -83,7 +78,7 @@ func TestRedPacketsMySQL(t *testing.T) {
 	assertGroupError(t, server, http.MethodPost, singlePath+"/claim", alice.Token, nil, codeNotConversationUser)
 	request(t, server, http.MethodDelete, "/api/v1/friends/"+bob.ID, alice.Token, nil, http.StatusOK, nil)
 	assertGroupError(t, server, http.MethodPost, path, alice.Token, packetInput(4, "100", 1), codeFriendshipRequired)
-	var firstClaim, repeatClaim redpacket.Claim
+	var firstClaim, repeatClaim social.Claim
 	request(t, server, http.MethodPost, singlePath+"/claim", bob.Token, nil, http.StatusOK, &firstClaim)
 	request(t, server, http.MethodPost, singlePath+"/claim", bob.Token, nil, http.StatusOK, &repeatClaim)
 	if firstClaim.Points != 100 || firstClaim != repeatClaim {
@@ -92,7 +87,7 @@ func TestRedPacketsMySQL(t *testing.T) {
 	request(t, server, http.MethodGet, "/api/v1/conversations/"+direct.ID+"/messages", alice.Token, nil, http.StatusOK, &history)
 	claimantID, _ := strconv.ParseInt(bob.ID, 10, 64)
 	if len(history) != 2 || history[0].Kind != chat.RedPacketClaimMessage || history[0].SenderID != claimantID ||
-		history[0].Content != "领取了红包" || history[1].Kind != chat.RedPacketMessage || history[1].RedPacketStatus != string(redpacket.Claimed) {
+		history[0].Content != "领取了红包" || history[1].Kind != chat.RedPacketMessage || history[1].RedPacketStatus != string(social.Claimed) {
 		t.Fatalf("claimed packet history = %+v", history)
 	}
 	var claimNoticeCount int
@@ -124,7 +119,7 @@ func TestRedPacketsMySQL(t *testing.T) {
 		switch err := <-outcomes; err {
 		case nil:
 			success++
-		case redpacket.ErrClaimed:
+		case social.ErrClaimed:
 		default:
 			t.Fatalf("concurrent claim: %v", err)
 		}
@@ -142,7 +137,7 @@ func TestRedPacketsMySQL(t *testing.T) {
 	expiringPath := "/api/v1/red-packets/" + expiring.ID
 	request(t, server, http.MethodPost, expiringPath+"/claim", bob.Token, nil, http.StatusOK, nil)
 	expiringID, _ := strconv.ParseInt(expiring.ID, 10, 64)
-	if err := packets.RefundDue(context.Background(), expiringID); err != redpacket.ErrNotYetExpired {
+	if err := packets.RefundDue(context.Background(), expiringID); err != social.ErrNotYetExpired {
 		t.Fatalf("refund before expiry: %v", err)
 	}
 	if _, err := db.Exec(`UPDATE red_packets SET expires_at = UTC_TIMESTAMP(6) WHERE id = ?`, expiring.ID); err != nil {
@@ -159,7 +154,7 @@ func TestRedPacketsMySQL(t *testing.T) {
 		defer concurrent.Done()
 		id, _ := strconv.ParseInt(expiring.ID, 10, 64)
 		_, err := packets.Claim(context.Background(), id, carolID)
-		if err == redpacket.ErrExpired {
+		if err == social.ErrExpired {
 			err = nil
 		} else {
 			err = fmt.Errorf("claim past expiry: %v", err)
@@ -200,11 +195,11 @@ func TestRedPacketsMySQL(t *testing.T) {
 		t.Fatalf("red packet outbox events = %d: %v", eventCount, err)
 	}
 	request(t, server, http.MethodGet, "/api/v1/points/ledger?limit=1", alice.Token, nil, http.StatusOK, &ledger)
-	if len(ledger) != 1 || ledger[0].Kind != points.Refund {
+	if len(ledger) != 1 || ledger[0].Kind != user.PointRefund || ledger[0].BalanceAfter != 845 {
 		t.Fatalf("last ledger page: %+v", ledger)
 	}
 	request(t, server, http.MethodGet, "/api/v1/points/ledger?limit=1&before_id="+strconv.FormatInt(ledger[0].ID, 10), alice.Token, nil, http.StatusOK, &ledger)
-	if len(ledger) != 1 || ledger[0].Kind != points.Send {
+	if len(ledger) != 1 || ledger[0].Kind != user.PointSend || ledger[0].BalanceAfter != 815 {
 		t.Fatalf("earlier ledger page: %+v", ledger)
 	}
 }

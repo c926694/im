@@ -9,23 +9,22 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/c926694/im/backend/internal/friendship"
 	"github.com/jmoiron/sqlx"
 )
 
 var (
-	ErrSelfConversation = errors.New("cannot open a direct conversation with yourself")
-	ErrUserNotFound     = errors.New("a conversation participant does not exist")
-	ErrNotMember        = errors.New("not a member of the conversation")
-	ErrMessageConflict  = errors.New("client message ID is used by a different message")
-	ErrInvalidReadSeq   = errors.New("read sequence is outside the conversation")
+	ErrNotFriends                = errors.New("users are not friends")
+	ErrPreviousMembershipMessage = errors.New("message belongs to a previous membership")
+	ErrSelfConversation          = errors.New("cannot open a direct conversation with yourself")
+	ErrUserNotFound              = errors.New("a conversation participant does not exist")
+	ErrNotMember                 = errors.New("not a member of the conversation")
+	ErrMessageConflict           = errors.New("client message ID is used by a different message")
+	ErrInvalidReadSeq            = errors.New("read sequence is outside the conversation")
 )
 
 // Store 汇总聊天业务需要的数据库操作，Service 通过它组合数据读写。
 type Store interface {
 	CountUsers(ctx context.Context, userID, peerID int64) (int, error)
-	AreFriends(ctx context.Context, userID, peerID int64) (bool, error)
-	AreFriendsTx(ctx context.Context, tx *sqlx.Tx, userID, peerID int64) (bool, error)
 	UpsertDirect(ctx context.Context, low, high int64) (int64, error)
 	ListConversations(ctx context.Context, userID int64, ids ...int64) ([]ConversationSummary, error)
 	ListConversationVersions(ctx context.Context, userID int64) ([]ConversationSummary, error)
@@ -38,7 +37,6 @@ type Store interface {
 	InsertGroup(ctx context.Context, tx *sqlx.Tx, name string) (int64, error)
 	ActiveMembers(ctx context.Context, tx *sqlx.Tx, id int64) ([]Member, error)
 	AddMembers(ctx context.Context, tx *sqlx.Tx, id, joinedSeq int64, role Role, userIDs []int64) error
-	CountFriends(ctx context.Context, tx *sqlx.Tx, actor int64, ids []int64) (int, error)
 	RenameGroup(ctx context.Context, tx *sqlx.Tx, id int64, name string) error
 	SetRole(ctx context.Context, tx *sqlx.Tx, id, userID int64, role Role) error
 	RemoveMember(ctx context.Context, tx *sqlx.Tx, id, userID int64) error
@@ -81,16 +79,6 @@ func (s *mysqlStore) CountUsers(ctx context.Context, userID, peerID int64) (int,
 	var users int
 	err := s.db.GetContext(ctx, &users, `SELECT COUNT(*) FROM users WHERE id IN (?, ?)`, userID, peerID)
 	return users, err
-}
-
-// AreFriends 查询当前数据库状态中的好友关系。
-func (s *mysqlStore) AreFriends(ctx context.Context, userID, peerID int64) (bool, error) {
-	return friendship.AreFriends(ctx, s.db, userID, peerID)
-}
-
-// AreFriendsTx 在发送事务中查询好友关系。
-func (s *mysqlStore) AreFriendsTx(ctx context.Context, tx *sqlx.Tx, userID, peerID int64) (bool, error) {
-	return friendship.AreFriends(ctx, tx, userID, peerID)
 }
 
 // UpsertDirect 创建单聊及成员记录，已有用户对则返回原会话。
@@ -496,18 +484,6 @@ func (s *mysqlStore) AddMembers(ctx context.Context, tx *sqlx.Tx, id, joinedSeq 
 		VALUES `+strings.Join(values, ", ")+` ON DUPLICATE KEY UPDATE role = ?, joined_seq = ?, last_read_seq = ?,
 		joined_at = CURRENT_TIMESTAMP(6), left_at = NULL`, args...)
 	return err
-}
-
-// CountFriends 批量检查邀请对象与操作者的已接受好友关系。
-func (s *mysqlStore) CountFriends(ctx context.Context, tx *sqlx.Tx, actor int64, ids []int64) (int, error) {
-	query, args, err := sqlx.In(`SELECT COUNT(*) FROM friendships WHERE status = 'accepted'
-		AND ((user_low_id = ? AND user_high_id IN (?)) OR (user_high_id = ? AND user_low_id IN (?)))`, actor, ids, actor, ids)
-	if err != nil {
-		return 0, err
-	}
-	var count int
-	err = tx.GetContext(ctx, &count, query, args...)
-	return count, err
 }
 
 // RenameGroup 更新会话标题，保留最近发消息的活动时间。

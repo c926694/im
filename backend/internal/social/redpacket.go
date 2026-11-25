@@ -1,4 +1,4 @@
-package redpacket
+package social
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 
 	"github.com/c926694/im/backend/internal/chat"
 	"github.com/c926694/im/backend/internal/outbox"
-	"github.com/c926694/im/backend/internal/points"
+	"github.com/c926694/im/backend/internal/user"
 	"github.com/jmoiron/sqlx"
 )
 
@@ -25,13 +25,29 @@ var (
 
 const packetTTL = 24 * time.Hour
 
-type Service struct {
-	store *Store
-	chat  *chat.Service
+type RedPacketStatus string
+
+const (
+	Open     RedPacketStatus = "open"
+	Claimed  RedPacketStatus = "claimed"
+	Refunded RedPacketStatus = "refunded"
+	Expired  RedPacketStatus = "expired"
+)
+
+type Packet struct {
+	ID             int64           `db:"id" json:"id,string"`
+	SenderID       int64           `db:"sender_id" json:"sender_id,string"`
+	RecipientID    *int64          `db:"recipient_id" json:"-"`
+	PointsPerShare int64           `db:"points_per_share" json:"points_per_share,string"`
+	ShareCount     int             `db:"share_count" json:"share_count"`
+	Remaining      int             `db:"remaining" json:"remaining"`
+	Status         RedPacketStatus `db:"status" json:"status"`
+	ExpiresAt      time.Time       `db:"expires_at" json:"expires_at"`
 }
 
-func NewService(store *Store, chatService *chat.Service) *Service {
-	return &Service{store: store, chat: chatService}
+type Claim struct {
+	Points    int64     `db:"points" json:"points,string"`
+	CreatedAt time.Time `db:"created_at" json:"created_at"`
 }
 
 type Draft struct {
@@ -100,7 +116,8 @@ func preparePacket(ctx context.Context, tx *sqlx.Tx, kind chat.Kind, recipients 
 	if err != nil {
 		return err
 	}
-	if err := points.Apply(ctx, tx, message.SenderID, points.Send, id, -draft.PointsPerShare*int64(draft.ShareCount)); err != nil {
+	// 余额不足时返回错误，由发送事务撤销红包写入。
+	if err := user.ApplyPointChange(ctx, tx, message.SenderID, user.PointSend, id, -draft.PointsPerShare*int64(draft.ShareCount)); err != nil {
 		return err
 	}
 	message.Content = "[红包]"
@@ -139,7 +156,7 @@ func (s *Service) Details(ctx context.Context, id, userID int64) (Details, error
 }
 
 // Statuses 按红包 ID 批量读取卡片颜色需要的当前状态。
-func (s *Service) Statuses(ctx context.Context, packetIDs []int64) (map[int64]Status, error) {
+func (s *Service) Statuses(ctx context.Context, packetIDs []int64) (map[int64]RedPacketStatus, error) {
 	return s.store.statuses(ctx, packetIDs)
 }
 
@@ -185,7 +202,8 @@ func (s *Service) Claim(ctx context.Context, id, userID int64) (Claim, error) {
 	if err := insertClaim(ctx, tx, id, userID, claim); err != nil {
 		return Claim{}, err
 	}
-	if err := points.Apply(ctx, tx, userID, points.Claim, id, claim.Points); err != nil {
+	// 领取记录和积分入账使用同一个事务。
+	if err := user.ApplyPointChange(ctx, tx, userID, user.PointClaim, id, claim.Points); err != nil {
 		return Claim{}, err
 	}
 	message, err := s.chat.SavePacketClaimMessage(ctx, tx, id, userID)
@@ -253,7 +271,8 @@ func (s *Service) RefundDue(ctx context.Context, id int64) error {
 	if err := updatePacket(ctx, tx, id, 0, Refunded); err != nil {
 		return err
 	}
-	if err := points.Apply(ctx, tx, packet.SenderID, points.Refund, id, packet.PointsPerShare*int64(packet.Remaining)); err != nil {
+	// 使用更新前的剩余份数计算退回积分。
+	if err := user.ApplyPointChange(ctx, tx, packet.SenderID, user.PointRefund, id, packet.PointsPerShare*int64(packet.Remaining)); err != nil {
 		return err
 	}
 	if err := outbox.Add(ctx, tx, outbox.Event{Kind: outbox.Refunded, PacketID: id}); err != nil {

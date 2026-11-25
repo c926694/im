@@ -6,22 +6,28 @@ import (
 	"errors"
 	"time"
 
-	"github.com/c926694/im/backend/internal/friendship"
 	"github.com/c926694/im/backend/internal/outbox"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 )
 
+// FriendshipChecker 供单聊检查好友资格；发送时沿用当前消息事务。
+type FriendshipChecker interface {
+	AreFriends(ctx context.Context, userID, peerID int64) (bool, error)
+	AreFriendsTx(ctx context.Context, tx *sqlx.Tx, userID, peerID int64) (bool, error)
+}
+
 // Service 组合聊天业务流程，并通过 Store 执行数据库读写。
 type Service struct {
 	store              Store
+	friendships        FriendshipChecker
 	imageDir           string
 	onMessageCommitted func()
 }
 
 // NewService 创建聊天业务服务。
-func NewService(store Store) *Service {
-	return &Service{store: store, imageDir: ImageDirectory()}
+func NewService(store Store, friendships FriendshipChecker, imageDir string) *Service {
+	return &Service{store: store, friendships: friendships, imageDir: imageDir}
 }
 
 // SetMessageCommittedListener 在服务启动前登记 Outbox 唤醒信号。
@@ -43,12 +49,12 @@ func (s *Service) CreateDirect(ctx context.Context, userID, peerID int64) (int64
 		return 0, ErrUserNotFound
 	}
 	// 好友资格以本次查询为准，建聊不锁好友关系。
-	accepted, err := s.store.AreFriends(ctx, userID, peerID)
+	accepted, err := s.friendships.AreFriends(ctx, userID, peerID)
 	if err != nil {
 		return 0, err
 	}
 	if !accepted {
-		return 0, friendship.ErrNotFriends
+		return 0, ErrNotFriends
 	}
 	// 规范化用户对，复用原会话及其成员记录。
 	return s.store.UpsertDirect(ctx, min(userID, peerID), max(userID, peerID))
@@ -106,7 +112,7 @@ func (s *Service) SaveMessage(ctx context.Context, tx *sqlx.Tx, userID, conversa
 	if err != nil {
 		return SendResult{}, err
 	}
-	member, err := s.requireMember(ctx, tx, userID, conversationID)
+	member, err := s.RequireMember(ctx, tx, userID, conversationID)
 	if err != nil {
 		return SendResult{}, err
 	}
@@ -120,7 +126,7 @@ func (s *Service) SaveMessage(ctx context.Context, tx *sqlx.Tx, userID, conversa
 		}
 		result.Recipients = []int64{recipientID}
 		// 好友状态按普通查询判定，不锁好友关系。
-		accepted, err = s.store.AreFriendsTx(ctx, tx, userID, recipientID)
+		accepted, err = s.friendships.AreFriendsTx(ctx, tx, userID, recipientID)
 		if err != nil {
 			return SendResult{}, err
 		}
@@ -141,7 +147,7 @@ func (s *Service) SaveMessage(ctx context.Context, tx *sqlx.Tx, userID, conversa
 		return SendResult{}, err
 	}
 	if !accepted {
-		return SendResult{}, friendship.ErrNotFriends
+		return SendResult{}, ErrNotFriends
 	}
 
 	message = Message{
@@ -153,7 +159,10 @@ func (s *Service) SaveMessage(ctx context.Context, tx *sqlx.Tx, userID, conversa
 		if err != nil {
 			return SendResult{}, err
 		}
-		result.Recipients = memberIDs(members)
+		result.Recipients = make([]int64, len(members))
+		for i, member := range members {
+			result.Recipients[i] = member.UserID
+		}
 	}
 	if err := prepare(conversation.Kind, result.Recipients, &message); err != nil {
 		return SendResult{}, err
@@ -188,7 +197,7 @@ func (s *Service) LastVisibleSeq(ctx context.Context, userID, conversationID int
 		return 0, err
 	}
 	defer tx.Rollback()
-	if _, err := s.requireMember(ctx, tx, userID, conversationID); err != nil {
+	if _, err := s.RequireMember(ctx, tx, userID, conversationID); err != nil {
 		return 0, err
 	}
 	conversation, err := s.store.GetConversation(ctx, tx, conversationID)
@@ -218,7 +227,7 @@ func (s *Service) readMessages(ctx context.Context, userID, conversationID, curs
 		return nil, err
 	}
 	defer tx.Rollback()
-	member, err := s.requireMember(ctx, tx, userID, conversationID)
+	member, err := s.RequireMember(ctx, tx, userID, conversationID)
 	if err != nil {
 		return nil, err
 	}
@@ -228,8 +237,8 @@ func (s *Service) readMessages(ctx context.Context, userID, conversationID, curs
 	return s.store.History(ctx, tx, conversationID, member.JoinedSeq, cursor, limit)
 }
 
-// requireMember 使用成员记录判断用户是否能访问会话。
-func (s *Service) requireMember(ctx context.Context, tx *sqlx.Tx, userID, conversationID int64) (Member, error) {
+// RequireMember 使用成员记录判断用户是否能访问会话。
+func (s *Service) RequireMember(ctx context.Context, tx *sqlx.Tx, userID, conversationID int64) (Member, error) {
 	member, err := s.store.Membership(ctx, tx, conversationID, userID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Member{}, ErrNotMember
@@ -244,7 +253,7 @@ func (s *Service) MarkRead(ctx context.Context, userID, conversationID, seq int6
 		return err
 	}
 	defer tx.Rollback()
-	member, err := s.requireMember(ctx, tx, userID, conversationID)
+	member, err := s.RequireMember(ctx, tx, userID, conversationID)
 	if err != nil {
 		return err
 	}
@@ -269,7 +278,7 @@ func (s *Service) VisiblePacketMessage(ctx context.Context, tx *sqlx.Tx, packetI
 	if err != nil {
 		return Message{}, err
 	}
-	member, err := s.requireMember(ctx, tx, userID, message.ConversationID)
+	member, err := s.RequireMember(ctx, tx, userID, message.ConversationID)
 	if err != nil {
 		return Message{}, err
 	}
@@ -292,7 +301,7 @@ func (s *Service) SavePacketClaimMessage(ctx context.Context, tx *sqlx.Tx, packe
 	if err != nil {
 		return Message{}, err
 	}
-	member, err := s.requireMember(ctx, tx, userID, conversation.ID)
+	member, err := s.RequireMember(ctx, tx, userID, conversation.ID)
 	if err != nil {
 		return Message{}, err
 	}

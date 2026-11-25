@@ -10,7 +10,7 @@ import (
 	"github.com/c926694/im/backend/internal/notify"
 	"github.com/c926694/im/backend/internal/outbox"
 	"github.com/c926694/im/backend/internal/realtime"
-	"github.com/c926694/im/backend/internal/redpacket"
+	"github.com/c926694/im/backend/internal/social"
 	"github.com/c926694/im/backend/internal/user"
 	"github.com/jmoiron/sqlx"
 )
@@ -22,11 +22,11 @@ func (n directNotificationTransport) Publish(ctx context.Context, event outbox.E
 }
 
 // startNotifications 使用实际的 Outbox 扫描、成员查询和 WebSocket 推送。
-func startNotifications(t *testing.T, db *sqlx.DB, chats *chat.Service, hub *realtime.Hub) {
+func startNotifications(t *testing.T, db *sqlx.DB, chats *chat.Service, socialService *social.Service, hub *realtime.Hub) {
 	t.Helper()
 	events := outbox.NewStore(db)
 	chats.SetMessageCommittedListener(events.Wake)
-	notifier := notify.New(chats, redpacket.NewService(redpacket.NewStore(db), chats), user.NewStore(db), hub)
+	notifier := notify.New(chats, socialService, user.NewStore(db), hub)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {

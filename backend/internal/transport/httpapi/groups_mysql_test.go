@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/c926694/im/backend/internal/chat"
-	"github.com/c926694/im/backend/internal/friendship"
 	"github.com/c926694/im/backend/internal/platform/mysql"
 	"github.com/c926694/im/backend/internal/realtime"
 	"github.com/c926694/im/backend/internal/user"
@@ -26,9 +25,9 @@ func TestGroupChatMySQL(t *testing.T) {
 	}
 	t.Cleanup(func() { db.Close() })
 	hub := realtime.NewHub()
-	chats := chat.NewService(chat.NewStore(db))
-	startNotifications(t, db, chats, hub)
-	server := testServer(t, NewRouter(user.NewStore(db), chats, friendship.NewService(friendship.NewStore(db)), hub, testSecret, nil, nil), hub)
+	chats, socialService := newTestServices(db, t.TempDir())
+	startNotifications(t, db, chats, socialService, hub)
+	server := testServer(t, NewRouter(user.NewStore(db), chats, socialService, hub, testSecret, t.TempDir()), hub)
 	owner := registerAndLogin(t, server, "owner", "")
 	admin := registerAndLogin(t, server, "admin", "")
 	member := registerAndLogin(t, server, "member", "")
@@ -57,9 +56,9 @@ func TestGroupChatMySQL(t *testing.T) {
 	if retry := send(t, server, messages, member.Token, 1); retry != first {
 		t.Fatalf("retry = %+v, want %+v", retry, first)
 	}
-	assertGroupError(t, server, http.MethodPatch, group, member.Token, map[string]string{"name": "无权修改"}, codeNotConversationUser)
+	assertGroupError(t, server, http.MethodPut, group, member.Token, map[string]string{"name": "无权修改"}, codeNotConversationUser)
 	assertGroupError(t, server, http.MethodPost, group+"/leave", owner.Token, nil, codeResourceConflict)
-	request(t, server, http.MethodPatch, members+"/"+admin.ID, owner.Token, map[string]string{"role": "admin"}, http.StatusOK, nil)
+	request(t, server, http.MethodPut, members+"/"+admin.ID, owner.Token, map[string]string{"role": "admin"}, http.StatusOK, nil)
 	assertGroupUpdate(t, events, id)
 	request(t, server, http.MethodPost, members, owner.Token, map[string]any{"member_ids": []string{admin.ID}}, http.StatusOK, nil)
 	assertGroupUpdate(t, events, id)
@@ -124,8 +123,8 @@ func TestGroupChatMySQL(t *testing.T) {
 	assertReadProgress(t, server, member.Token, 4, 0)
 
 	request(t, server, http.MethodPost, group+"/transfer", owner.Token, map[string]string{"user_id": admin.ID}, http.StatusOK, nil)
-	assertGroupError(t, server, http.MethodPatch, group, owner.Token, map[string]string{"name": "无权修改"}, codeNotConversationUser)
-	request(t, server, http.MethodPatch, group, admin.Token, map[string]string{"name": "已转让群聊"}, http.StatusOK, nil)
+	assertGroupError(t, server, http.MethodPut, group, owner.Token, map[string]string{"name": "无权修改"}, codeNotConversationUser)
+	request(t, server, http.MethodPut, group, admin.Token, map[string]string{"name": "已转让群聊"}, http.StatusOK, nil)
 	request(t, server, http.MethodGet, group, admin.Token, nil, http.StatusOK, &details)
 	if details.Name != "已转让群聊" {
 		t.Fatalf("group name = %q", details.Name)

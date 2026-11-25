@@ -17,11 +17,12 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
+	"github.com/jmoiron/sqlx"
 
 	"github.com/c926694/im/backend/internal/chat"
-	"github.com/c926694/im/backend/internal/friendship"
 	"github.com/c926694/im/backend/internal/platform/mysql"
 	"github.com/c926694/im/backend/internal/realtime"
+	"github.com/c926694/im/backend/internal/social"
 	"github.com/c926694/im/backend/internal/user"
 )
 
@@ -54,9 +55,16 @@ type apiResponse struct {
 
 var testSecret = []byte("test-only-jwt-key-with-at-least-32-bytes")
 
+func newTestServices(db *sqlx.DB, imageDir string) (*chat.Service, *social.Service) {
+	chatStore := chat.NewStore(db)
+	socialStore := social.NewStore(db)
+	chats := chat.NewService(chatStore, socialStore, imageDir)
+	return chats, social.NewService(socialStore, chats, chatStore)
+}
+
 func TestHealthResponse(t *testing.T) {
 	hub := realtime.NewHub()
-	server := testServer(t, NewRouter(nil, nil, nil, hub, testSecret, nil, nil), hub)
+	server := testServer(t, NewRouter(nil, nil, nil, hub, testSecret, t.TempDir()), hub)
 	var health apiResponse
 	request(t, server, http.MethodGet, "/healthz", "", nil, http.StatusOK, &health)
 	if health.Code != codeSuccess || health.Msg != "success" || string(health.Data) != `{"status":"ok"}` {
@@ -96,9 +104,9 @@ func TestDirectChatMySQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	hub := realtime.NewHub()
-	chats := chat.NewService(chat.NewStore(db))
-	startNotifications(t, db, chats, hub)
-	server := testServer(t, NewRouter(user.NewStore(db), chats, friendship.NewService(friendship.NewStore(db)), hub, testSecret, nil, nil), hub)
+	chats, socialService := newTestServices(db, t.TempDir())
+	startNotifications(t, db, chats, socialService, hub)
+	server := testServer(t, NewRouter(user.NewStore(db), chats, socialService, hub, testSecret, t.TempDir()), hub)
 	alice := registerAndLogin(t, server, "alice", "")
 	bob := registerAndLogin(t, server, "bob", "?")
 	outsider := registerAndLogin(t, server, "outsider", "  "+strings.Repeat("你好!", 25)+"\n\t ")
@@ -304,13 +312,13 @@ func befriend(t *testing.T, server *httptest.Server, from, to testAccount) {
 	var entry friendRequestResponse
 	request(t, server, http.MethodPost, "/api/v1/friend-requests", from.Token,
 		map[string]string{"peer_username": to.Username}, http.StatusOK, &entry)
-	request(t, server, http.MethodPatch, "/api/v1/friend-requests/"+entry.ID, to.Token,
+	request(t, server, http.MethodPut, "/api/v1/friend-requests/"+entry.ID, to.Token,
 		map[string]string{"status": "accepted"}, http.StatusOK, nil)
 }
 
 func TestWebSocketTickets(t *testing.T) {
 	hub := realtime.NewHub()
-	server := testServer(t, NewRouter(nil, nil, nil, hub, testSecret, nil, nil), hub)
+	server := testServer(t, NewRouter(nil, nil, nil, hub, testSecret, t.TempDir()), hub)
 	const ticketPath = "/api/v1/ws/tickets"
 	request(t, server, http.MethodPost, ticketPath, "", nil, http.StatusUnauthorized, nil)
 	request(t, server, http.MethodPost, ticketPath, signedToken(t, jwt.SigningMethodHS512, time.Now().Add(time.Hour)), nil, http.StatusUnauthorized, nil)

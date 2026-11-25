@@ -7,6 +7,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/c926694/im/backend/internal/platform/mysql"
@@ -24,14 +25,17 @@ func TestAvatarMySQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	t.Setenv("IM_AVATAR_DIR", t.TempDir())
 	hub := realtime.NewHub()
-	server := testServer(t, NewRouter(user.NewStore(db), nil, nil, hub, testSecret, nil, nil), hub)
+	server := testServer(t, NewRouter(user.NewStore(db), nil, nil, hub, testSecret, t.TempDir()), hub)
 	account := registerAndLogin(t, server, "avatar", "")
 	var profile user.Profile
 	request(t, server, http.MethodGet, "/api/v1/me", account.Token, nil, http.StatusOK, &profile)
 	if profile.AvatarURL != "/avatars/default.webp" {
 		t.Fatalf("default avatar: %q", profile.AvatarURL)
+	}
+	var storedURL string
+	if err := db.Get(&storedURL, `SELECT avatar_url FROM users WHERE id = ?`, account.ID); err != nil || storedURL != profile.AvatarURL {
+		t.Fatalf("stored default avatar: %q, %v", storedURL, err)
 	}
 
 	upload := func(token string, data []byte) (int, string) {
@@ -48,7 +52,7 @@ func TestAvatarMySQL(t *testing.T) {
 		if err := writer.Close(); err != nil {
 			t.Fatal(err)
 		}
-		req, err := http.NewRequest(http.MethodPatch, server.URL+"/api/v1/me/avatar", &body)
+		req, err := http.NewRequest(http.MethodPut, server.URL+"/api/v1/me/avatar", &body)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -81,8 +85,11 @@ func TestAvatarMySQL(t *testing.T) {
 		}
 	}
 	code, avatarURL := upload(account.Token, defaultAvatar)
-	if code != 0 || avatarURL == "" || avatarURL == profile.AvatarURL {
+	if code != 0 || !strings.HasPrefix(avatarURL, "/avatars/") || avatarURL == profile.AvatarURL {
 		t.Fatalf("upload: %d %q", code, avatarURL)
+	}
+	if err := db.Get(&storedURL, `SELECT avatar_url FROM users WHERE id = ?`, account.ID); err != nil || storedURL != avatarURL {
+		t.Fatalf("stored uploaded avatar: %q, %v", storedURL, err)
 	}
 	request(t, server, http.MethodGet, "/api/v1/me", account.Token, nil, http.StatusOK, &profile)
 	if profile.AvatarURL != avatarURL {
